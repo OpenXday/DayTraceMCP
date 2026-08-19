@@ -10,7 +10,6 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.graphics.Rect
 import com.daytrace.data.MessageEntry
-import com.daytrace.net.WebhookSender
 import com.daytrace.util.Prefs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,20 +17,17 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
- * 无障碍服务 —— 时间线记录器
+ * 日迹无障碍服务 —— 三通道时间线记录
  *
- * 设计理念：不打扰用户，低频快照，按时间线记录手机使用轨迹。
+ * 通道1：定时快照（每30秒）
+ *   不管在做什么，每30秒拍一次屏幕快照，提取可见文本
  *
- * 工作模式：
- * 1. 监听窗口切换事件（TYPE_WINDOW_STATE_CHANGED），记录"用户打开了哪个App"
- * 2. 每 30 秒做一次轻量快照：记录当前前台 App + 屏幕上可见的关键文本
- * 3. 不逐条推送 Webhook，只存 DB
- * 4. Markdown 导出和 Webhook 摘要由其他组件按天/按需触发
+ * 通道2：输入实时捕获（TYPE_VIEW_TEXT_CHANGED）
+ *   当你在任何 app 的输入框里打字时，实时记录"在哪个app输入了什么"
+ *   完整记录输入内容，不截断
  *
- * 这样做的优点：
- * - 省电：不做高频的 View 遍历
- * - 不打扰：不会疯狂推送
- * - 不遗漏：窗口切换 + 定期快照覆盖了主要活动轨迹
+ * 通道3：App切换快照（TYPE_WINDOW_STATE_CHANGED）
+ *   每次切换 app 时，立刻拍一张快照 + 记录上一个 app 的使用时长
  */
 class CaptureAccessibilityService : AccessibilityService() {
 
@@ -41,23 +37,27 @@ class CaptureAccessibilityService : AccessibilityService() {
         @Volatile var isRunning = false
             private set
 
-        /** 快照间隔（毫秒） */
+        /** 定时快照间隔（毫秒）—— 30秒 */
         private const val SNAPSHOT_INTERVAL_MS = 30_000L
 
-        /** 当前正在前台的应用包名 */
+        /** 当前前台 App */
         @Volatile private var currentForegroundPackage: String? = null
 
         /** 当前前台 App 进入时间 */
         @Volatile private var currentAppEnterTime: Long = 0
 
-        /** 上次快照时间 */
+        /** 上次定时快照时间 */
         @Volatile private var lastSnapshotTime: Long = 0
 
-        /** 已记录过的 (packageName, text) 组合，避免重复 */
-        private val recordedHashes = ArrayDeque<Int>(300)
-
-        /** 上次窗口切换时记录的包名，避免重复记录同一 App */
-        @Volatile private var lastWindowChangePkg: String? = null
+        // === 输入捕获状态 ===
+        /** 当前正在输入的包名 */
+        @Volatile private var inputTrackingPackage: String? = null
+        /** 当前输入框的最新文本 */
+        @Volatile private var currentInputText: String? = null
+        /** 上次记录输入文本的时间（用于判断输入暂停） */
+        @Volatile private var lastInputTime: Long = 0
+        /** 上次记录的输入文本（用于去重） */
+        @Volatile private var lastRecordedInput: String? = null
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -77,29 +77,45 @@ class CaptureAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** 输入暂停检测：如果用户停止输入超过 3 秒，记录最后一次输入内容 */
+    private val inputFlushRunnable = object : Runnable {
+        override fun run() {
+            try {
+                flushInputIfNeeded()
+            } catch (_: Exception) {}
+            handler.postDelayed(this, 3000)
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         isRunning = true
-        Log.i(TAG, "Accessibility service connected (timeline mode)")
+        Log.i(TAG, "Accessibility service connected (3-channel timeline mode)")
 
-        // 动态配置：只监听窗口切换 + 文本变化（轻量）
+        // 三通道配置：窗口切换 + 文本变化 + 内容变化
         try {
             val info = AccessibilityServiceInfo().apply {
                 eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                    AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                    AccessibilityEvent.TYPE_WINDOWS_CHANGED or
+                    AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
                 feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
                 flags = AccessibilityServiceInfo.DEFAULT or
-                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-                notificationTimeout = 200
+                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                    AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
+                notificationTimeout = 100
             }
             serviceInfo = info
-            Log.i(TAG, "ServiceInfo configured for timeline mode")
+            Log.i(TAG, "ServiceInfo configured: window+text+content")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to configure ServiceInfo: ${e.message}")
         }
 
         // 启动定时快照
         handler.postDelayed(snapshotRunnable, SNAPSHOT_INTERVAL_MS)
+        // 启动输入暂停检测
+        handler.postDelayed(inputFlushRunnable, 3000)
 
         // 写入数据库标记
         scope.launch {
@@ -131,141 +147,153 @@ class CaptureAccessibilityService : AccessibilityService() {
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                handleWindowChange(packageName, event)
+                handleWindowChange(packageName)
             }
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
-                // 窗口变化时，如果前台 App 变了，记录
                 if (packageName != currentForegroundPackage) {
-                    handleWindowChange(packageName, event)
+                    handleWindowChange(packageName)
+                }
+            }
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
+                handleTextInput(event, packageName)
+            }
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                // 轻量处理：只在内容变化时更新前台包名
+                if (packageName != currentForegroundPackage) {
+                    currentForegroundPackage = packageName
+                    currentAppEnterTime = System.currentTimeMillis()
                 }
             }
         }
     }
 
-    /**
-     * 窗口切换：记录"用户打开了某 App"
-     */
-    private fun handleWindowChange(packageName: String, event: AccessibilityEvent) {
-        val now = System.currentTimeMillis()
+    // ========================
+    // 通道1：定时快照
+    // ========================
 
-        // 记录上一个 App 的使用时长
-        val prevPkg = currentForegroundPackage
-        if (prevPkg != null && prevPkg != packageName && currentAppEnterTime > 0) {
-            val duration = (now - currentAppEnterTime) / 1000
-            if (duration > 3) {  // 超过3秒才算有效使用
-                recordAppUsage(prevPkg, currentAppEnterTime, now, duration)
-            }
-        }
-
-        currentForegroundPackage = packageName
-        currentAppEnterTime = now
-        lastWindowChangePkg = packageName
-
-        // 记录窗口切换事件
-        recordEvent(packageName, "打开应用", "window_change")
-    }
-
-    /**
-     * 定时快照：轻量地记录当前屏幕上可见的关键文本
-     */
     private fun takeSnapshot() {
         val pkg = currentForegroundPackage ?: return
         val now = System.currentTimeMillis()
 
-        // 至少使用 10 秒后才做快照（避免快速切换）
-        if (now - currentAppEnterTime < 10_000) return
-
-        // 节流：同一 App 每 60 秒最多一次快照
-        if (now - lastSnapshotTime < 60_000) return
-        lastSnapshotTime = now
-
         try {
             val root = rootInActiveWindow ?: return
-            val visibleText = extractKeyText(root, pkg)
+            val visibleText = extractVisibleText(root)
+
             if (visibleText.isNotEmpty()) {
                 recordEvent(pkg, visibleText, "snapshot")
+            } else {
+                // 即使没有提取到文本，也记录一条"屏幕为空"的快照
+                recordEvent(pkg, "(无可见文本)", "snapshot")
             }
+            lastSnapshotTime = now
         } catch (e: Exception) {
             Log.w(TAG, "snapshot extract failed: ${e.message}")
         }
     }
 
     /**
-     * 从屏幕节点中提取关键文本（轻量版）
-     * 只取前 5 个有意义的文本节点，不做全量遍历
+     * 提取屏幕所有可见文本
+     * 无过滤、无截断、无深度限制，完整记录屏幕上每一个文本节点
+     * 按 Y 坐标排序（从上到下），每条文本独立一行
      */
-    private fun extractKeyText(root: AccessibilityNodeInfo, packageName: String): String {
-        val texts = mutableListOf<String>()
-        collectMeaningfulTexts(root, texts, 0, 5, 8)
+    private fun extractVisibleText(root: AccessibilityNodeInfo): String {
+        val textNodes = mutableListOf<Pair<String, Rect>>()
+        collectAllTextNodes(root, textNodes)
 
-        if (texts.isEmpty()) return ""
+        if (textNodes.isEmpty()) return ""
 
-        return texts
-            .filter { it.length >= 4 }  // 只要长度 >= 4 的
-            .filter { !isUiNoise(it) }
-            .take(5)  // 最多取 5 条
-            .joinToString(" | ")
+        // 按 Y 坐标排序（从上到下）
+        textNodes.sortBy { it.second.top }
+
+        // 每条文本一行，完整保留
+        return textNodes
+            .map { it.first }
+            .joinToString("\n")
     }
 
     /**
-     * 收集有意义的文本节点（深度受限）
+     * 递归收集所有有文本的节点，无深度限制、无数量限制
      */
-    private fun collectMeaningfulTexts(
+    private fun collectAllTextNodes(
         node: AccessibilityNodeInfo,
-        out: MutableList<String>,
-        depth: Int,
-        maxDepth: Int,
-        maxResults: Int
+        out: MutableList<Pair<String, Rect>>
     ) {
-        if (depth > maxDepth || out.size >= maxResults) return
-
+        // 收集 text
         val text = node.text?.toString()?.trim()
-        if (text != null && text.isNotEmpty() && text.length <= 200) {
-            out.add(text)
+        if (text != null && text.isNotEmpty()) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            out.add(text to rect)
         }
 
+        // 收集 contentDescription（部分按钮的文本在这里）
+        val desc = node.contentDescription?.toString()?.trim()
+        if (desc != null && desc.isNotEmpty() && desc != text) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            out.add(desc to rect)
+        }
+
+        // 递归子节点
         for (i in 0 until node.childCount) {
-            if (out.size >= maxResults) return
             val child = node.getChild(i) ?: continue
-            collectMeaningfulTexts(child, out, depth + 1, maxDepth, maxResults)
+            collectAllTextNodes(child, out)
         }
     }
 
-    /**
-     * 判断是否为 UI 噪音文本
-     */
-    private fun isUiNoise(text: String): Boolean {
-        // 纯时间
-        if (text.matches(Regex("""^\d{1,2}:\d{2}$"""))) return true
-        // 纯数字
-        if (text.matches(Regex("""^\d+$"""))) return true
-        // 日期
-        if (text.matches(Regex("""^\d{1,2}/\d{1,2}"""))) return true
-        // 太短（按钮/标签）
-        if (text.length <= 3) return true
-        // 常见 UI 文本
-        val noiseSet = setOf(
-            "发送", "取消", "确定", "保存", "返回", "更多", "搜索", "设置",
-            "消息", "通讯录", "工作台", "日历", "文档", "我的",
-            "分享", "收藏", "转发", "删除", "复制", "详情页",
-            "表情", "语音", "视频", "文件", "位置"
-        )
-        if (text in noiseSet) return true
-        return false
+    // ========================
+    // 通道2：输入实时捕获
+    // ========================
+
+    private fun handleTextInput(event: AccessibilityEvent, packageName: String) {
+        // 获取输入文本
+        var text = event.text?.joinToString("")?.trim() ?: ""
+        if (text.isEmpty()) {
+            val source = event.source
+            text = source?.text?.toString()?.trim() ?: ""
+        }
+
+        if (text.isEmpty()) {
+            // 输入框被清空 —— 可能是发送了消息
+            if (currentInputText != null && inputTrackingPackage == packageName) {
+                val sentText = currentInputText!!
+                val elapsed = SystemClock.elapsedRealtime() - lastInputTime
+                if (sentText.length >= 1 && elapsed < 30_000) {
+                    // 记录"发送"的输入内容
+                    recordInput(packageName, sentText, "input_send")
+                }
+                currentInputText = null
+                inputTrackingPackage = null
+            }
+            return
+        }
+
+        // 更新输入状态
+        inputTrackingPackage = packageName
+        currentInputText = text
+        lastInputTime = SystemClock.elapsedRealtime()
     }
 
     /**
-     * 记录一条时间线事件到 DB
+     * 输入暂停检测：如果用户停止输入超过 3 秒，记录输入内容
      */
-    private fun recordEvent(packageName: String, text: String, source: String) {
-        // 去重
-        val hash = "$packageName:$text:${System.currentTimeMillis() / 60_000}".hashCode()
-        synchronized(recordedHashes) {
-            if (recordedHashes.contains(hash)) return
-            recordedHashes.addFirst(hash)
-            if (recordedHashes.size > 300) recordedHashes.removeLast()
-        }
+    private fun flushInputIfNeeded() {
+        val pkg = inputTrackingPackage ?: return
+        val text = currentInputText ?: return
+        val now = SystemClock.elapsedRealtime()
 
+        // 如果超过 3 秒没有新的输入事件
+        if (now - lastInputTime > 3000) {
+            // 只在文本变化时记录（与上次记录的不同）
+            if (text != lastRecordedInput && text.length >= 1) {
+                recordInput(pkg, text, "input")
+                lastRecordedInput = text
+            }
+            // 不清空，因为用户可能继续输入
+        }
+    }
+
+    private fun recordInput(packageName: String, text: String, source: String) {
         val appName = getAppName(packageName)
         val entry = MessageEntry(
             appPackage = packageName,
@@ -276,37 +304,113 @@ class CaptureAccessibilityService : AccessibilityService() {
             source = source
         )
 
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
                 val app = applicationContext as com.daytrace.DayTraceApp
                 app.database.messageDao().insert(entry)
-                Log.d(TAG, "Recorded [$appName] via $source: ${text.take(60)}")
+                com.daytrace.export.TimelineExporter.appendEntry(applicationContext, entry)
+                Log.d(TAG, "Recorded input [$appName] via $source: ${text.take(80)}")
             } catch (e: Exception) {
-                Log.e(TAG, "record failed: ${e.message}")
+                Log.e(TAG, "record input failed: ${e.message}")
             }
         }
     }
 
-    /**
-     * 记录 App 使用时长
-     */
-    private fun recordAppUsage(packageName: String, enterTime: Long, exitTime: Long, durationSec: Long) {
+    // ========================
+    // 通道3：App 切换快照
+    // ========================
+
+    private fun handleWindowChange(packageName: String) {
+        val now = System.currentTimeMillis()
+
+        // 记录上一个 App 的使用时长
+        val prevPkg = currentForegroundPackage
+        if (prevPkg != null && prevPkg != packageName && currentAppEnterTime > 0) {
+            val duration = (now - currentAppEnterTime) / 1000
+            if (duration > 2) {
+                recordAppUsage(prevPkg, duration)
+            }
+        }
+
+        // 如果有未刷新的输入，先记录
+        val pendingInput = currentInputText
+        if (pendingInput != null && inputTrackingPackage == prevPkg && pendingInput.length >= 1) {
+            recordInput(prevPkg!!, pendingInput, "input_switch")
+            currentInputText = null
+            inputTrackingPackage = null
+            lastRecordedInput = null
+        }
+
+        currentForegroundPackage = packageName
+        currentAppEnterTime = now
+
+        // 记录 App 切换
+        recordEvent(packageName, "→ $packageName", "window_change")
+
+        // 立即拍一张快照
+        try {
+            val root = rootInActiveWindow
+            if (root != null) {
+                // 延迟 500ms 等界面渲染完成
+                handler.postDelayed({
+                    try {
+                        val delayedRoot = rootInActiveWindow
+                        if (delayedRoot != null) {
+                            val visibleText = extractVisibleText(delayedRoot)
+                            if (visibleText.isNotEmpty()) {
+                                recordEvent(packageName, visibleText, "switch_snapshot")
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }, 500)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun recordAppUsage(packageName: String, durationSec: Long) {
         val appName = getAppName(packageName)
-        val text = "使用 $appName ${durationSec}秒"
+        val entry = MessageEntry(
+            appPackage = packageName,
+            appName = appName,
+            direction = MessageEntry.DIR_OUTGOING,
+            contactOrGroup = "",
+            text = "使用 $appName ${durationSec}秒",
+            source = "app_usage"
+        )
+
+        scope.launch(Dispatchers.IO) {
+            try {
+                val app = applicationContext as com.daytrace.DayTraceApp
+                app.database.messageDao().insert(entry)
+                com.daytrace.export.TimelineExporter.appendEntry(applicationContext, entry)
+            } catch (_: Exception) {}
+        }
+    }
+
+    // ========================
+    // 公共方法
+    // ========================
+
+    private fun recordEvent(packageName: String, text: String, source: String) {
+        val appName = getAppName(packageName)
         val entry = MessageEntry(
             appPackage = packageName,
             appName = appName,
             direction = MessageEntry.DIR_OUTGOING,
             contactOrGroup = "",
             text = text,
-            source = "app_usage"
+            source = source
         )
 
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
                 val app = applicationContext as com.daytrace.DayTraceApp
                 app.database.messageDao().insert(entry)
-            } catch (_: Exception) {}
+                com.daytrace.export.TimelineExporter.appendEntry(applicationContext, entry)
+                Log.d(TAG, "Recorded [$appName] via $source: ${text.take(60)}")
+            } catch (e: Exception) {
+                Log.e(TAG, "record failed: ${e.message}")
+            }
         }
     }
 
@@ -327,6 +431,7 @@ class CaptureAccessibilityService : AccessibilityService() {
         super.onDestroy()
         isRunning = false
         handler.removeCallbacks(snapshotRunnable)
+        handler.removeCallbacks(inputFlushRunnable)
         Log.i(TAG, "Accessibility service destroyed")
     }
 }

@@ -248,21 +248,27 @@ fun TimelineItem(msg: MessageEntry, dao: MessageDao, scope: kotlinx.coroutines.C
 
     val isOutgoing = msg.direction == MessageEntry.DIR_OUTGOING
     val dotColor = when {
-        msg.source == "notification" -> Color(0xFFA6E3A1)
-        msg.source == "window_change" -> Color(0xFF89B4FA)
-        msg.source == "snapshot" -> Color(0xFFF9E2AF)
-        msg.source == "app_usage" -> Color(0xFFFAB387)
-        msg.source.startsWith("system") -> Color(0xFFF38BA8)
+        msg.source.startsWith("input") -> Color(0xFFF38BA8)   // 输入 = 粉红
+        msg.source == "notification" -> Color(0xFFA6E3A1)    // 通知 = 绿
+        msg.source == "window_change" -> Color(0xFF89B4FA)   // 切换 = 蓝
+        msg.source == "snapshot" -> Color(0xFFF9E2AF)         // 快照 = 黄
+        msg.source == "switch_snapshot" -> Color(0xFF89D0FF)  // 切换快照 = 亮蓝
+        msg.source == "app_usage" -> Color(0xFFFAB387)       // 时长 = 橙
+        msg.source.startsWith("system") -> Color(0xFFF38BA8) // 系统 = 粉红
         else -> Color(0xFF6C7086)
     }
 
-    val sourceLabel = when (msg.source) {
-        "window_change" -> "打开"
-        "snapshot" -> "快照"
-        "app_usage" -> "时长"
-        "notification" -> "通知"
-        "system" -> "系统"
-        "system_event" -> "事件"
+    val sourceLabel = when {
+        msg.source == "input" -> "输入"
+        msg.source == "input_send" -> "发送"
+        msg.source == "input_switch" -> "输入→切换"
+        msg.source == "window_change" -> "切换"
+        msg.source == "snapshot" -> "快照"
+        msg.source == "switch_snapshot" -> "切换快照"
+        msg.source == "app_usage" -> "时长"
+        msg.source == "notification" -> "通知"
+        msg.source == "system" -> "系统"
+        msg.source == "system_event" -> "事件"
         else -> msg.source
     }
 

@@ -339,10 +339,11 @@ class NotificationCaptureService : NotificationListenerService() {
             chatType = chatType
         )
 
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
                 val app = applicationContext as com.daytrace.DayTraceApp
                 app.database.messageDao().insert(entry)
+                com.daytrace.export.TimelineExporter.appendEntry(applicationContext, entry)
                 Log.d(TAG, "Saved incoming [$appName/$sender] group=$chatType: ${cleanText.take(50)}")
             } catch (e: Exception) {
                 Log.e(TAG, "save failed: ${e.message}")
