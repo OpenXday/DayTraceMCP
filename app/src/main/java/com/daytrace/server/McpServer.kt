@@ -266,6 +266,41 @@ class McpServer(
                 }
             ))
             add(toolJson(
+                name = "push_timeline_diff",
+                description = "Upload the day's timeline diff via the selected Upload Skill (e.g. Biji/OpenAPI, generic JSON, multipart, or webhook). Each upload is named with date+time to prevent overwrite. Only sends incremental content since last upload.",
+                properties = buildJsonObject {
+                    put("date", propObj("string", "Date in YYYY-MM-DD format (empty = today)", ""))
+                    put("forceFull", propObj("boolean", "Force full upload instead of diff (default false)", false))
+                }
+            ))
+            add(toolJson(
+                name = "get_upload_progress",
+                description = "Get the upload progress for a specific date (how much has been uploaded vs total).",
+                properties = buildJsonObject {
+                    put("date", propObj("string", "Date in YYYY-MM-DD format (empty = today)", ""))
+                }
+            ))
+            add(toolJson(
+                name = "list_skills",
+                description = "List all available upload Skills (built-in and imported .skill.md files)."
+            ))
+            add(toolJson(
+                name = "load_skill",
+                description = "Load (activate) a Skill by its id. The activated Skill will be used for subsequent uploads.",
+                properties = buildJsonObject {
+                    put("skillId", propObj("string", "Skill id (e.g. biji, generic_json, webhook)", ""))
+                },
+                required = listOf("skillId")
+            ))
+            add(toolJson(
+                name = "import_skill",
+                description = "Import a Skill from a network URL pointing to a .skill.md Markdown file.",
+                properties = buildJsonObject {
+                    put("url", propObj("string", "URL to .skill.md file", ""))
+                },
+                required = listOf("url")
+            ))
+            add(toolJson(
                 name = "clear_all_messages",
                 description = "Delete all captured messages. Use with caution!"
             ))
@@ -459,6 +494,79 @@ class McpServer(
                     com.daytrace.net.WebhookSender.pushDaySummary(context, dateMillis)
                 }
                 "Webhook summary pushed for ${if (dateStr.isEmpty()) "today" else dateStr}"
+            }
+
+            "push_timeline_diff" -> {
+                val dateStr = args["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                val forceFull = args["forceFull"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+                val dateMillis = parseDateOrToday(dateStr)
+                val result = kotlinx.coroutines.runBlocking {
+                    com.daytrace.net.DiffUploader.uploadDayDiff(context, dateMillis, forceFull)
+                }
+                buildString {
+                    appendLine("=== Timeline Diff Upload ===")
+                    appendLine("Date: ${if (dateStr.isEmpty()) "today" else dateStr}")
+                    appendLine("Mode: ${if (forceFull) "full" else "diff"}")
+                    appendLine("Success: ${result.success}")
+                    appendLine("Message: ${result.message}")
+                    appendLine("Uploaded bytes: ${result.uploadedBytes}")
+                    appendLine("Total bytes: ${result.totalBytes}")
+                }
+            }
+
+            "get_upload_progress" -> {
+                val dateStr = args["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                val dateMillis = parseDateOrToday(dateStr)
+                val progress = com.daytrace.net.DiffUploader.getUploadProgress(context, dateMillis)
+                buildString {
+                    appendLine("=== Upload Progress ===")
+                    appendLine("Date: ${progress.dateStr}")
+                    appendLine("Total size: ${progress.totalSize} bytes")
+                    appendLine("Uploaded: ${progress.uploadedOffset} bytes")
+                    appendLine("Remaining: ${progress.remainingBytes} bytes")
+                    appendLine("Progress: ${progress.progressPercent}%")
+                    appendLine("Complete: ${progress.isComplete}")
+                    val lastTime = if (progress.lastUploadTime > 0)
+                        SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date(progress.lastUploadTime))
+                    else "never"
+                    appendLine("Last upload: $lastTime")
+                }
+            }
+
+            "list_skills" -> {
+                val skills = com.daytrace.net.SkillManager.getAllSkills(context)
+                buildString {
+                    appendLine("Available Skills:")
+                    for (skill in skills) {
+                        appendLine("- ${skill.id}: ${skill.name} ${if (skill.isImported) "(imported)" else "(built-in)"}")
+                        appendLine("  ${skill.description}")
+                        if (skill.credentials.isNotEmpty()) {
+                            appendLine("  Credentials: ${skill.credentials.joinToString(", ") { it.id }}")
+                        }
+                    }
+                }
+            }
+
+            "load_skill" -> {
+                val skillId = args["skillId"]?.jsonPrimitive?.contentOrNull ?: ""
+                val skill = com.daytrace.net.SkillManager.getSkill(context, skillId)
+                if (skill != null) {
+                    com.daytrace.util.Prefs.setUploadSkillId(context, skillId)
+                    "Skill '${skill.name}' ($skillId) activated."
+                } else {
+                    "Skill not found: $skillId"
+                }
+            }
+
+            "import_skill" -> {
+                val url = args["url"]?.jsonPrimitive?.contentOrNull ?: ""
+                kotlinx.coroutines.runBlocking {
+                    val result = com.daytrace.net.SkillManager.importFromUrl(context, url)
+                    result.fold(
+                        onSuccess = { skill -> "Skill imported: ${skill.name} (${skill.id})" },
+                        onFailure = { e -> "Import failed: ${e.message}" }
+                    )
+                }
             }
 
             "clear_all_messages" -> {

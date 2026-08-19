@@ -108,6 +108,19 @@ object WebhookSender {
     }
 
     /**
+     * 通过 Webhook 推送文本（供 DiffUploader 调用，从 Prefs 读 URL/Token）
+     */
+    fun pushText(context: Context, title: String, body: String) {
+        val url = Prefs.getWebhookUrl(context)
+        val token = Prefs.getWebhookToken(context)
+        if (url.isBlank()) {
+            Log.w(TAG, "pushText: webhook URL is blank")
+            return
+        }
+        pushText(url, token, title, body)
+    }
+
+    /**
      * 推送单条消息（保留兼容，但新模式下不主动调用）
      */
     fun pushMessage(context: Context, entry: MessageEntry) {
@@ -136,7 +149,10 @@ object WebhookSender {
         }
     }
 
-    private fun pushText(url: String, token: String, title: String, body: String) {
+    /**
+     * 通过 Webhook 推送文本（内部使用，也被 DiffUploader 调用）
+     */
+    internal fun pushText(url: String, token: String, title: String, body: String) {
         val isChanify = url.contains("/v1/sender/") || token.isNotBlank()
 
         if (isChanify) {

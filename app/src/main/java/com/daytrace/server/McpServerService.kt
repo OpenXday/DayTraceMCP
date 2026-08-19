@@ -10,6 +10,9 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import com.daytrace.util.Prefs
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * 前台服务，持有 MCP Server 的生命周期
@@ -43,6 +46,15 @@ class McpServerService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, McpServerService::class.java))
         }
+
+        /** 重新检查 Tunnel 状态（外部调用，如设置页切换开关后） */
+        fun refreshTunnel(context: Context) {
+            val intent = Intent(context, McpServerService::class.java)
+            intent.putExtra("refresh_tunnel", true)
+            if (isRunning) {
+                context.startService(intent)
+            }
+        }
     }
 
     private var server: McpServer? = null
@@ -58,19 +70,53 @@ class McpServerService : Service() {
         isRunning = true
         mcpPort = server?.getPort() ?: port
         Log.i(TAG, "MCP Server foreground service started, port=$mcpPort")
+
+        // 如果 Tunnel 开关已开，自动启动 Cloudflare Tunnel
+        if (Prefs.isTunnelEnabled(this)) {
+            startTunnel()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        CloudflareTunnelManager.stop()
         server?.stopServer()
         server = null
         isRunning = false
         Log.i(TAG, "MCP Server foreground service destroyed")
     }
 
+    /** 启动 Cloudflare Tunnel */
+    private fun startTunnel() {
+        val port = mcpPort
+        CoroutineScope(Dispatchers.IO).launch {
+            val ok = CloudflareTunnelManager.start(this@McpServerService, port)
+            val url = CloudflareTunnelManager.tunnelUrl
+            if (ok && url.isNotEmpty()) {
+                updateNotification("MCP Server :$port | Tunnel: $url")
+            } else {
+                val err = CloudflareTunnelManager.lastError ?: "未知错误"
+                updateNotification("MCP Server :$port | Tunnel 失败: $err")
+            }
+        }
+    }
+
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(NOTIF_ID, buildNotification(text))
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.getBooleanExtra("refresh_tunnel", false) == true) {
+            if (Prefs.isTunnelEnabled(this) && !CloudflareTunnelManager.isRunning) {
+                startTunnel()
+            } else if (!Prefs.isTunnelEnabled(this) && CloudflareTunnelManager.isRunning) {
+                CloudflareTunnelManager.stop()
+                updateNotification("MCP Server running on port $mcpPort")
+            }
+        }
         return START_STICKY
     }
 

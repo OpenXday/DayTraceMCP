@@ -43,10 +43,47 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 运行时控制是否从最近任务列表隐藏
+        applyRecentsVisibility()
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 DayTraceRoot()
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 每次回到前台时重新检查设置（用户可能在设置页改了）
+        applyRecentsVisibility()
+    }
+
+    /**
+     * 根据 Prefs 设置控制 Activity 是否在最近任务列表中可见
+     *
+     * 使用 ActivityManager.AppTask 的 excludeFromRecents，或者
+     * 通过 setTaskDefaultValues 修改（不同 API level 略有不同）
+     *
+     * 简单实现：如果用户开启了隐藏，则标记 excludeFromRecents
+     * 这个 flag 会在下次进入最近任务时生效
+     */
+    private fun applyRecentsVisibility() {
+        try {
+            val hide = Prefs.isHideFromRecents(this)
+            // 使用 ActivityManager.AppTask 来控制
+            val am = getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val tasks = am.appTasks
+            for (task in tasks) {
+                if (task.taskInfo?.taskId == taskId) {
+                    // setExcludeFromRecents 需要 API 23+
+                    task.setExcludeFromRecents(hide)
+                    break
+                }
+            }
+        } catch (e: Exception) {
+            // 忽略：某些设备/ROM 可能不支持
         }
     }
 }

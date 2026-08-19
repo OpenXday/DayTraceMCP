@@ -113,6 +113,113 @@ curl -X POST http://<手机IP>:9876/mcp \
 
 设置 → Webhook → 填入 Chanify URL + Token → 点击"推送当天摘要"
 
+## Skill 驱动差分上传
+
+DayTrace 采用 **Skill 驱动** 的上传架构。Skill 是 Markdown 格式的配置文件（`.skill.md`），定义了多步骤工作流（HTTP 请求、变量提取、条件执行），填入凭证后即可自动上传时间线到对应服务。
+
+### Skill 文件格式
+
+```markdown
+---
+id: biji
+name: 得到大脑 (get笔记)
+description: 通过得到大脑开放 API 创建/更新笔记
+version: 1.0
+credentials:
+  - id: api_key
+    label: API Key
+    placeholder: gk_live_xxx
+    isSecret: true
+  - id: client_id
+    label: Client ID
+---
+
+## Step 1: 创建笔记
+
+POST https://openapi.biji.com/open/api/v1/resource/note/create
+
+Headers:
+Authorization: {{api_key}}
+X-Client-ID: {{client_id}}
+
+Body:
+{"title":"{{title}}","content":"{{content}}"}
+
+Extract:
+noteId = data.note_id
+
+Success: success
+
+## Step 2: 追加内容
+
+Condition: {{noteId}} != ''
+
+POST https://openapi.biji.com/open/api/v1/resource/note/update
+
+Headers:
+Authorization: {{api_key}}
+
+Body:
+{"note_id":"{{noteId}}","content":"{{content}}"}
+```
+
+**占位符**：`{{credential_id}}`（凭证）、`{{title}}` `{{content}}` `{{date}}` `{{time}}` `{{uploadType}}`（系统变量）、`{{noteId}}` 等（前一步 Extract 的值）
+
+### 内置 Skill
+
+| Skill | 服务 | 需要填写的凭证 |
+|------|------|------|
+| **得到大脑 (get笔记)** | biji.com 开放 API | API Key + Client ID |
+| **通用 JSON 上传** | 任意 REST API | 上传 URL + Bearer Token（可选） |
+| **Webhook 推送** | Chanify / 通用 HTTP | Webhook URL + Token（可选） |
+
+### 导入自定义 Skill
+
+支持从网络 URL 导入 `.skill.md` 文件：设置 → 差分上传 → 导入 Skill → 填入 URL。导入的 Skill 存储在 `filesDir/skills/` 下，可删除。
+
+### 核心设计
+
+1. **Skill = Markdown 工作流**：YAML frontmatter 定义元数据和凭证，`## Step N` 定义多步骤
+2. **多步骤执行**：按顺序执行每个 Step，支持 Condition 条件跳过、Extract 变量提取
+3. **差分上传**：每次上传只发送自上次上传以来的增量内容（字节偏移机制）
+4. **防覆盖**：上传标题按 `日期_时间` 命名，不会覆盖
+5. **定时调度**：可配置多个时间点自动上传（如 `09:00, 12:00, 18:00, 23:00`）
+
+### 定时调度
+
+- 使用 `AlarmManager` 精确定时，即使 App 被杀死也能唤醒
+- `setExactAndAllowWhileIdle` 适配 Doze 模式
+- 开机/更新后自动恢复定时任务（`BootReceiver`）
+
+### 设置方式
+
+设置 → 差分上传 → 启用上传 → 选择/导入 Skill → 填入凭证 → 测试连接 → 开启定时 → 配置时间点
+
+## Cloudflare 公网隧道
+
+MCP Server 默认只能在局域网内访问。DayTrace 集成了 **Cloudflare Quick Tunnel (trycloudflare)**，可将 MCP Server 暴露到公网，让任何设备随时访问。
+
+### 工作原理
+
+在手机上运行 `cloudflared` 二进制，创建临时隧道，获得公网 URL（如 `https://abc-xyz.trycloudflare.com/mcp`）。
+
+### 二进制按需下载
+
+`cloudflared` 二进制**不打入 APK**（APK 仅 55MB），在 App 内按需下载：
+- App 自动识别设备架构（arm64-v8a / armeabi-v7a / x86_64）
+- 从 [GitHub Releases](https://github.com/cloudflare/cloudflared/releases) 下载对应二进制（约 35MB）
+- 下载进度实时显示，也可用浏览器手动下载
+
+### 使用方式
+
+设置 → MCP Server → Cloudflare 公网隧道：
+1. 点击「下载二进制」下载 cloudflared
+2. 下载完成后打开隧道开关
+3. 等待约 10-30 秒获取公网 URL
+4. 在外部设备用 `https://xxx.trycloudflare.com/mcp` 访问
+
+> 每次启动 URL 会变（临时隧道），前台通知显示当前 URL
+
 ## MCP Server 工具
 
 | 工具 | 说明 |
@@ -120,6 +227,11 @@ curl -X POST http://<手机IP>:9876/mcp \
 | `get_timeline` | 获取当天 Markdown（优先读实时文件） |
 | `export_timeline` | 生成带统计概要的完整版 |
 | `push_webhook_summary` | 推送当天摘要到 Webhook |
+| `upload_day_diff` | 通过选定的 Skill 差分上传时间线 |
+| `get_upload_progress` | 获取指定日期的上传进度 |
+| `list_skills` | 列出所有可用的上传 Skill |
+| `load_skill` | 激活指定的 Skill |
+| `import_skill` | 从网络 URL 导入 .skill.md 文件 |
 | `get_recent_messages` | 获取最近 DB 记录 |
 | `search_messages` | 搜索记录 |
 | `get_message_stats` | 统计信息 |
@@ -127,12 +239,23 @@ curl -X POST http://<手机IP>:9876/mcp \
 | `list_conversations` | 对话列表 |
 | `clear_all_messages` | 清空记录 |
 
-**Claude Desktop 配置**：
+**Claude Desktop 配置（局域网）**：
 ```json
 {
   "mcpServers": {
     "daytrace": {
       "url": "http://<手机IP>:9876/mcp"
+    }
+  }
+}
+```
+
+**Claude Desktop 配置（公网隧道）**：
+```json
+{
+  "mcpServers": {
+    "daytrace": {
+      "url": "https://xxx-yyy.trycloudflare.com/mcp"
     }
   }
 }
@@ -177,10 +300,15 @@ app/src/main/java/com/daytrace/
 ├── export/
 │   └── TimelineExporter.kt      # 实时追加 MD + 完整导出
 ├── server/
-│   ├── McpServer.kt             # MCP JSON-RPC
-│   └── McpServerService.kt      # MCP 前台服务
+│   ├── McpServer.kt             # MCP JSON-RPC（含 Skill 管理工具）
+│   ├── McpServerService.kt       # MCP 前台服务 + Tunnel 生命周期
+│   └── CloudflareTunnelManager.kt  # cloudflared 进程管理 + 按需下载
 ├── net/
-│   └── WebhookSender.kt         # Webhook 摘要推送
+│   ├── WebhookSender.kt         # Webhook 摘要推送
+│   ├── DiffUploader.kt          # Skill 执行引擎（多步骤 + 占位符 + 差分）
+│   ├── SkillRegistry.kt         # Skill Markdown 解析器 + 管理器
+│   ├── UploadScheduler.kt       # 定时上传调度（AlarmManager）
+│   └── BootReceiver.kt          # 开机自启动恢复定时上传
 ├── ui/
 │   ├── HistoryScreen.kt         # 时间线页面
 │   └── SettingsScreen.kt        # 设置页面
@@ -189,6 +317,15 @@ app/src/main/java/com/daytrace/
     └── Prefs.kt                  # 偏好设置
 ```
 
+## 后台隐藏
+
+App 在设置页提供了「从最近任务隐藏」开关（默认关闭 = 显示）：
+- 关闭（默认）：App 正常显示在最近任务列表中
+- 开启：App 从最近任务列表隐藏，防止被误划掉删除
+- 使用 `ActivityManager.AppTask.setExcludeFromRecents()` 运行时控制
+- 前台通知仍保留（系统要求），但任务列表中不显示
+- 如需打开 App，从桌面图标启动即可
+
 ## 设计理念
 
 - **不打扰**：不逐条推送通知，不做高频全量扫描
@@ -196,6 +333,10 @@ app/src/main/java/com/daytrace/
 - **不遗漏**：定时快照 + 输入捕获 + 通知监听三通道覆盖
 - **实时性**：每条记录实时写入 MD 文件，随时可取用
 - **可总结**：结构化 Markdown 表格，方便 AI 理解
+- **差分上传**：增量上传省流量，防覆盖命名安全
+- **Skill 驱动**：Markdown 格式定义多步骤上传工作流，可导入自定义 Skill
+- **公网隧道**：内置 cloudflared 按需下载，一键暴露 MCP 到公网
+- **后台隐藏**：不在最近任务中显示，防误杀
 - **隐私优先**：所有数据仅存本机
 
 ## 构建
@@ -212,11 +353,11 @@ cd E:\source\typevault
 - `minSdk = 29` (Android 10)
 - `targetSdk = 36` (Android 16)
 - `applicationId = com.daytrace`
-- `versionName = 0.2.0`
+- `versionName = 0.3.0`
 
 ## 已知局限
 
 1. **仅文本**：图片/语音/文件内容无法获取
 2. **输入捕获依赖 IME**：部分 app 的自定义输入框可能不触发 TEXT_CHANGED 事件
 3. **通知内容隐藏**：部分 IM 锁屏状态下隐藏通知内容
-4. **MCP 安全性**：无认证机制，确保只在可信网络中使用
+4. **MCP 安全性**：无认证机制，确保只在可信网络中使用（公网隧道 URL 随机但公开）
