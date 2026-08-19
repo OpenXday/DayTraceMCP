@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">日迹 DayTrace</string>
+    <string name="accessibility_service_label">日迹 · 时间线记录</string>
+    <string name="accessibility_service_desc">按时间线记录你在各应用中的活动轨迹，生成每日 Markdown 时间线供 AI 总结。所有数据仅保存在本机。</string>
+    <string name="notification_service_label">日迹 · 通知记录</string>
+</resources>

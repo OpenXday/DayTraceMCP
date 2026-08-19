@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 简单的盾牌+锁图标，代表消息安全采集 -->
+    <path
+        android:fillColor="#89B4FA"
+        android:pathData="M54,28 L72,36 L72,54 C72,66 64,76 54,80 C44,76 36,66 36,54 L36,36 Z" />
+    <path
+        android:fillColor="#1E1E2E"
+        android:pathData="M54,44 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0 M49,50 L59,50 L59,60 L49,60 Z" />
+</vector>
