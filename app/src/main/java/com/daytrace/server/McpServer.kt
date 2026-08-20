@@ -14,6 +14,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
@@ -21,17 +22,21 @@ import kotlinx.serialization.json.add
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * MCP (Model Context Protocol) Server
  *
- * 提供一个嵌入式 HTTP JSON-RPC 服务器，让 Claude Desktop / 其他 AI 工具
+ * 提供 MCP Streamable HTTP 传输规范兼容的端点，让 Claude Desktop / 其他 AI 工具
  * 可以通过 HTTP 接口查询 DayTrace 中采集的消息。
  *
- * 端点：
- *   POST /mcp  (JSON-RPC 2.0)
- *   GET  /       (健康检查)
- *   GET  /mcp/tools (工具列表)
+ * MCP Streamable HTTP 传输端点：
+ *   POST   /mcp        (JSON-RPC 2.0 请求，支持 SSE 响应)
+ *   GET    /mcp        (SSE 流 — 服务器推送事件)
+ *   DELETE /mcp        (终止会话)
+ *   GET    /           (健康检查)
+ *   GET    /mcp/tools  (工具列表，便利端点)
  */
 class McpServer(
     private val context: Context,
@@ -40,7 +45,16 @@ class McpServer(
 
     companion object {
         private const val TAG = "DayTrace/MCP"
+        private const val MCP_ENDPOINT = "/mcp"
+        private const val SESSION_HEADER = "Mcp-Session-Id"
+        private const val PROTOCOL_VERSION = "2025-06-18"
     }
+
+    /** MCP 会话管理 */
+    private val sessions = ConcurrentHashMap<String, Boolean>()
+
+    /** 生成新的会话 ID */
+    private fun newSessionId(): String = UUID.randomUUID().toString()
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -122,23 +136,125 @@ class McpServer(
             return jsonResponse(health.toString())
         }
 
-        // MCP JSON-RPC endpoint
-        if (uri == "/mcp" && method == Method.POST) {
-            return handleRpc(session)
+        // MCP Streamable HTTP transport endpoint
+        if (uri == MCP_ENDPOINT) {
+            return handleMcpEndpoint(session, method)
         }
 
-        // SSE/info endpoint
-        if (uri == "/mcp/sse" && method == Method.GET) {
-            return handleSseInfo()
-        }
-
-        // OpenAPI-style discovery
+        // OpenAPI-style discovery (convenience endpoint)
         if (uri == "/mcp/tools" && method == Method.GET) {
             val tools = listTools()
             return jsonResponse(tools.toString())
         }
 
-        val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found: $uri")
+        // Legacy SSE info endpoint
+        if (uri == "/mcp/sse" && method == Method.GET) {
+            return handleSseInfo()
+        }
+
+        // 405 for unsupported methods on known paths, 404 for unknown paths
+        val resp = if (uri.startsWith("/mcp")) {
+            newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, MIME_PLAINTEXT, "Method not allowed: $method $uri")
+        } else {
+            newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found: $uri")
+        }
+        addCorsHeaders(resp)
+        return resp
+    }
+
+    /**
+     * 处理 MCP Streamable HTTP 传输端点
+     *
+     * POST   /mcp — JSON-RPC 请求（可能请求 SSE 响应）
+     * GET    /mcp — SSE 流（服务器推送事件）
+     * DELETE /mcp — 终止会话
+     */
+    private fun handleMcpEndpoint(session: IHTTPSession, method: Method): Response {
+        return when (method) {
+            Method.POST -> handleRpc(session)
+            Method.GET -> handleSseStream(session)
+            Method.DELETE -> handleDeleteSession(session)
+            else -> {
+                val resp = newFixedLengthResponse(
+                    Response.Status.METHOD_NOT_ALLOWED,
+                    "application/json",
+                    """{"error":"Method not allowed","message":"Use POST, GET, or DELETE on /mcp"}"""
+                )
+                addCorsHeaders(resp)
+                resp
+            }
+        }
+    }
+
+    /** 处理 DELETE /mcp — 终止会话 */
+    private fun handleDeleteSession(session: IHTTPSession): Response {
+        val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
+        if (sessionId.isNotEmpty()) {
+            sessions.remove(sessionId)
+            Log.i(TAG, "Session deleted: $sessionId")
+        }
+        val resp = newFixedLengthResponse(Response.Status.OK, "application/json", "{}")
+        addCorsHeaders(resp)
+        return resp
+    }
+
+    /**
+     * 处理 GET /mcp — SSE 流
+     *
+     * MCP Streamable HTTP 规范：客户端可以打开 GET /mcp 来接收服务器推送事件。
+     * 我们返回一个简单的 SSE 流，保持连接并定期发送 ping。
+     * 如果客户端没有有效会话，返回 400。
+     */
+    private fun handleSseStream(session: IHTTPSession): Response {
+        val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
+        val acceptHeader = session.headers["accept"] ?: ""
+
+        // 如果客户端不接受 text/event-stream，返回基本信息
+        if (!acceptHeader.contains("text/event-stream")) {
+            val info = buildJsonObject {
+                put("endpoint", "POST /mcp")
+                put("methods", "tools/list, tools/call, resources/list, resources/read")
+                put("note", "Use HTTP POST /mcp for JSON-RPC 2.0")
+                put("discovery", "GET /mcp/tools for tool list")
+            }
+            return jsonResponse(info.toString())
+        }
+
+        // 返回 SSE 流
+        // NanoHTTPD 的 newChunkedResponse 需要 InputStream
+        // 我们创建一个 PipedInputStream/PipedOutputStream 来持续推送 SSE 事件
+        val pipedInput = java.io.PipedInputStream(1024)
+        val pipedOutput = java.io.PipedOutputStream(pipedInput)
+
+        // 启动一个线程来推送 SSE 事件
+        Thread {
+            try {
+                // 发送初始 ping
+                pipedOutput.write(": ping\n\n".toByteArray())
+                pipedOutput.flush()
+
+                // 每隔 15 秒发送 ping，保持连接
+                while (!Thread.currentThread().isInterrupted) {
+                    Thread.sleep(15000)
+                    pipedOutput.write(": ping\n\n".toByteArray())
+                    pipedOutput.flush()
+                }
+            } catch (e: Exception) {
+                // 连接关闭，正常退出
+                Log.d(TAG, "SSE stream closed: ${e.message}")
+            } finally {
+                try { pipedOutput.close() } catch (_: Exception) {}
+            }
+        }.apply {
+            isDaemon = true
+            name = "MCP-SSE-$sessionId"
+            start()
+        }
+
+        val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", pipedInput)
+        resp.addHeader("Cache-Control", "no-cache")
+        resp.addHeader("Connection", "keep-alive")
+        resp.addHeader("X-Accel-Buffering", "no")
         addCorsHeaders(resp)
         return resp
     }
@@ -151,8 +267,9 @@ class McpServer(
 
     private fun addCorsHeaders(resp: Response) {
         resp.addHeader("Access-Control-Allow-Origin", "*")
-        resp.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        resp.addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        resp.addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        resp.addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
+        resp.addHeader("Access-Control-Expose-Headers", "Mcp-Session-Id")
     }
 
     private fun handleSseInfo(): Response {
@@ -174,6 +291,21 @@ class McpServer(
             return errorResponse(-32700, "Parse error: ${e.message}", null)
         }
 
+        // 空请求体可能是批量请求或 SSE 初始化
+        if (body.isBlank()) {
+            return errorResponse(-32700, "Parse error: empty request body", null)
+        }
+
+        // 检查是否是批量请求（JSON 数组）
+        val isBatchRequest = body.trimStart().startsWith("[")
+
+        val acceptHeader = session.headers["accept"] ?: ""
+        val wantsSse = acceptHeader.contains("text/event-stream")
+
+        if (isBatchRequest) {
+            return handleBatchRpc(body, session, wantsSse)
+        }
+
         val request = try {
             json.parseToJsonElement(body).jsonObject
         } catch (e: Exception) {
@@ -184,9 +316,44 @@ class McpServer(
         val method = request["method"]?.jsonPrimitive?.contentOrNull
         val params = request["params"]?.jsonObject
 
+        // 检查会话
+        val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
+
+        // initialize 请求需要创建新会话
+        if (method == "initialize") {
+            val newSessId = newSessionId()
+            sessions[newSessId] = true
+            Log.i(TAG, "New MCP session created: $newSessId")
+
+            val result = initializeResult()
+            val response = buildJsonObject {
+                put("jsonrpc", "2.0")
+                if (id != null) put("id", id) else put("id", JsonPrimitive(0))
+                put("result", result)
+            }
+
+            val resp = if (wantsSse) {
+                // 以 SSE 格式返回响应
+                sseResponse(response.toString(), newSessId)
+            } else {
+                jsonResponse(response.toString())
+            }
+            resp.addHeader(SESSION_HEADER, newSessId)
+            addCorsHeaders(resp)
+            return resp
+        }
+
+        // 非 initialize 请求需要有效会话（如果客户端使用会话）
+        if (sessionId.isNotEmpty() && !sessions.containsKey(sessionId)) {
+            val resp = errorResponse(-32000, "Invalid session: $sessionId", id)
+            resp.addHeader(SESSION_HEADER, sessionId)
+            return resp
+        }
+
         val result = try {
             when (method) {
                 "initialize" -> initializeResult()
+                "initialized" -> buildJsonObject { } // 通知，无需响应
                 "tools/list" -> listTools()
                 "tools/call" -> callTool(params)
                 "resources/list" -> listResources()
@@ -199,12 +366,94 @@ class McpServer(
             return errorResponse(-32603, "Internal error: ${e.message}", id)
         }
 
+        // 通知（id 为 null 的请求）不需要返回结果
+        if (id == null && method == "initialized") {
+            val resp = newFixedLengthResponse(Response.Status.OK, "application/json", "{}")
+            addCorsHeaders(resp)
+            if (sessionId.isNotEmpty()) resp.addHeader(SESSION_HEADER, sessionId)
+            return resp
+        }
+
         val response = buildJsonObject {
             put("jsonrpc", "2.0")
             if (id != null) put("id", id) else put("id", JsonPrimitive(0))
             put("result", result)
         }
-        return jsonResponse(response.toString())
+
+        val resp = if (wantsSse) {
+            sseResponse(response.toString(), sessionId)
+        } else {
+            jsonResponse(response.toString())
+        }
+        if (sessionId.isNotEmpty()) {
+            resp.addHeader(SESSION_HEADER, sessionId)
+        }
+        addCorsHeaders(resp)
+        return resp
+    }
+
+    /** 处理批量 JSON-RPC 请求 */
+    private fun handleBatchRpc(body: String, session: IHTTPSession, wantsSse: Boolean): Response {
+        val requests = try {
+            json.parseToJsonElement(body).jsonArray
+        } catch (e: Exception) {
+            return errorResponse(-32700, "Parse error: ${e.message}", null)
+        }
+
+        val results = buildJsonArray {
+            for (i in 0 until requests.size) {
+                val req = requests[i].jsonObject
+                val id: JsonElement? = req["id"]
+                val method = req["method"]?.jsonPrimitive?.contentOrNull
+                val params = req["params"]?.jsonObject
+
+                if (id == null) {
+                    // 通知，不返回结果
+                    continue
+                }
+
+                val result = try {
+                    when (method) {
+                        "initialize" -> initializeResult()
+                        "tools/list" -> listTools()
+                        "tools/call" -> callTool(params)
+                        "resources/list" -> listResources()
+                        "resources/read" -> readResource(params)
+                        "ping" -> buildJsonObject { put("pong", true) }
+                        else -> buildJsonObject {
+                            put("code", -32601)
+                            put("message", "Method not found: $method")
+                        }
+                    }
+                } catch (e: Exception) {
+                    buildJsonObject {
+                        put("code", -32603)
+                        put("message", "Internal error: ${e.message}")
+                    }
+                }
+
+                add(buildJsonObject {
+                    put("jsonrpc", "2.0")
+                    put("id", id)
+                    put("result", result)
+                })
+            }
+        }
+
+        val resp = jsonResponse(results.toString())
+        addCorsHeaders(resp)
+        return resp
+    }
+
+    /** 构建 SSE 格式响应 */
+    private fun sseResponse(jsonRpcResponse: String, sessionId: String): Response {
+        val sseData = "data: $jsonRpcResponse\n\n"
+        val stream = java.io.ByteArrayInputStream(sseData.toByteArray())
+        val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", stream)
+        resp.addHeader("Cache-Control", "no-cache")
+        resp.addHeader("Connection", "keep-alive")
+        resp.addHeader("X-Accel-Buffering", "no")
+        return resp
     }
 
     private fun errorResponse(code: Int, message: String, id: JsonElement?): Response {
@@ -680,10 +929,15 @@ class McpServer(
 
     private fun initializeResult(): JsonObject {
         return buildJsonObject {
-            put("protocolVersion", "2024-11-05")
+            put("protocolVersion", PROTOCOL_VERSION)
             put("capabilities", buildJsonObject {
-                put("tools", buildJsonObject {})
-                put("resources", buildJsonObject {})
+                put("tools", buildJsonObject {
+                    put("listChanged", true)
+                })
+                put("resources", buildJsonObject {
+                    put("listChanged", true)
+                })
+                put("logging", buildJsonObject {})
             })
             put("serverInfo", buildJsonObject {
                 put("name", "DayTrace MCP Server")

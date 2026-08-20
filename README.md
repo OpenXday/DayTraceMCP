@@ -203,6 +203,16 @@ MCP Server 默认只能在局域网内访问。DayTrace 集成了 **Cloudflare Q
 
 在手机上运行 `cloudflared` 二进制，创建临时隧道，获得公网 URL（如 `https://abc-xyz.trycloudflare.com/mcp`）。
 
+### Android DNS 解决方案
+
+`cloudflared` 是 Go 静态编译（CGO_ENABLED=0），只能用纯 Go DNS resolver。Android 上 `/etc/resolv.conf` 不存在，Go fallback 到 `[::1]:53`，导致 DNS 解析失败。
+
+DayTrace 采用 **App 层 DNS 代理** 策略绕过此限制：
+1. App 通过 OkHttp 调用 Cloudflare API 创建 Quick Tunnel（App 有正常 DNS）
+2. App 通过 Java `InetAddress` 解析 Cloudflare Edge IP（`region1.argotunnel.com`）
+3. 构造 credentials JSON + YAML 配置文件（含 Edge IP）
+4. 通过 Shizuku 启动 `cloudflared tunnel --config <yml> run`，配置中的 Edge IP 让 cloudflared 直接连 IP，不需要 DNS
+
 ### 二进制按需下载
 
 `cloudflared` 二进制**不打入 APK**（APK 仅 55MB），在 App 内按需下载：
@@ -215,29 +225,60 @@ MCP Server 默认只能在局域网内访问。DayTrace 集成了 **Cloudflare Q
 设置 → MCP Server → Cloudflare 公网隧道：
 1. 点击「下载二进制」下载 cloudflared
 2. 下载完成后打开隧道开关
-3. 等待约 10-30 秒获取公网 URL
+3. 等待约 10-60 秒获取公网 URL
 4. 在外部设备用 `https://xxx.trycloudflare.com/mcp` 访问
 
-> 每次启动 URL 会变（临时隧道），前台通知显示当前 URL
+> 每次启动 URL 会变（临时隧道），前台通知显示当前 URL，并自动复制到剪贴板
 
-## MCP Server 工具
+## MCP Server
+
+DayTrace MCP Server 实现了 **MCP Streamable HTTP 传输规范**（协议版本 `2025-06-18`），支持以下 HTTP 方法：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/mcp` | JSON-RPC 2.0 请求（支持 SSE 响应） |
+| `GET` | `/mcp` | SSE 流（服务器推送事件，保持连接） |
+| `DELETE` | `/mcp` | 终止会话 |
+| `GET` | `/` | 健康检查 |
+| `GET` | `/mcp/tools` | 工具列表（便利端点） |
+
+### 会话管理
+
+- `initialize` 请求创建新会话，返回 `Mcp-Session-Id` header
+- 后续请求可携带该 header 维持会话
+- `DELETE /mcp` 终止会话
+- 支持 `notifications/initialized` 通知
+- 支持批量 JSON-RPC 请求
+
+### 安全认证
+
+设置 → MCP Server → 安全认证：
+- 启用后，请求需携带 `Authorization: Bearer <token>` header
+- 也支持 `?token=xxx` query parameter
+- 未认证请求返回 `401 Unauthorized`
+
+### MCP 工具列表
 
 | 工具 | 说明 |
 |------|------|
 | `get_timeline` | 获取当天 Markdown（优先读实时文件） |
 | `export_timeline` | 生成带统计概要的完整版 |
 | `push_webhook_summary` | 推送当天摘要到 Webhook |
-| `upload_day_diff` | 通过选定的 Skill 差分上传时间线 |
+| `push_timeline_diff` | 通过选定的 Skill 差分上传时间线（增量内容） |
 | `get_upload_progress` | 获取指定日期的上传进度 |
-| `list_skills` | 列出所有可用的上传 Skill |
+| `list_skills` | 列出所有可用的上传 Skill（内置 + 导入） |
 | `load_skill` | 激活指定的 Skill |
 | `import_skill` | 从网络 URL 导入 .skill.md 文件 |
-| `get_recent_messages` | 获取最近 DB 记录 |
-| `search_messages` | 搜索记录 |
-| `get_message_stats` | 统计信息 |
-| `get_messages_by_date` | 按日期查询 |
-| `list_conversations` | 对话列表 |
-| `clear_all_messages` | 清空记录 |
+| `get_recent_messages` | 获取最近 DB 记录（可按方向/应用过滤） |
+| `search_messages` | 按关键词搜索记录 |
+| `get_message_stats` | 统计信息（总数/方向/按应用） |
+| `get_messages_by_date` | 按时间范围查询 |
+| `get_app_list` | 获取所有已采集消息的应用列表 |
+| `get_conversation` | 获取指定应用和联系人的完整对话上下文 |
+| `list_conversations` | 列出所有对话（应用 + 联系人/群组） |
+| `clear_all_messages` | 清空所有记录（谨慎使用） |
+
+### 客户端配置
 
 **Claude Desktop 配置（局域网）**：
 ```json
@@ -261,16 +302,54 @@ MCP Server 默认只能在局域网内访问。DayTrace 集成了 **Cloudflare Q
 }
 ```
 
+**带认证的配置**：
+```json
+{
+  "mcpServers": {
+    "daytrace": {
+      "url": "http://<手机IP>:9876/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+**curl 示例**：
+```bash
+# 初始化会话
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+# 获取今天的时间线
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_timeline","arguments":{}}}'
+
+# 搜索消息
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_messages","arguments":{"keyword":"飞书"}}}'
+```
+
 ## 安装
 
 ### 1. 安装 Shizuku
 
 安装 Shizuku（CoolAPK / GitHub），通过无线调试启动（Android 11+）。
 
+> Shizuku 用于：一键授权无障碍权限、执行 cloudflared 二进制（Android 10+ 禁止 App 直接 execve ELF）
+
 ### 2. 安装 DayTrace
 
 ```powershell
+# Debug 版
 adb install app\build\outputs\apk\debug\app-debug.apk
+
+# Release 版（推荐）
+adb install app\build\outputs\apk\release\app-release.apk
 ```
 
 ### 3. 一键授权
@@ -283,6 +362,12 @@ adb install app\build\outputs\apk\debug\app-debug.apk
 - 每条记录实时写入 `timeline-yyyy-MM-dd.md`
 - 时间线页查看记录
 - 提交 MD 文件给 AI 总结
+
+### 5. 公网访问（可选）
+
+- 设置 → MCP Server → Cloudflare 公网隧道
+- 下载 cloudflared → 开启隧道 → 获取公网 URL
+- 在任意设备通过公网 URL 访问 MCP
 
 ## 项目结构
 
@@ -300,9 +385,9 @@ app/src/main/java/com/daytrace/
 ├── export/
 │   └── TimelineExporter.kt      # 实时追加 MD + 完整导出
 ├── server/
-│   ├── McpServer.kt             # MCP JSON-RPC（含 Skill 管理工具）
+│   ├── McpServer.kt             # MCP Streamable HTTP 服务器（JSON-RPC + SSE + 会话管理）
 │   ├── McpServerService.kt       # MCP 前台服务 + Tunnel 生命周期
-│   └── CloudflareTunnelManager.kt  # cloudflared 进程管理 + 按需下载
+│   └── CloudflareTunnelManager.kt  # cloudflared 进程管理 + DNS 代理 + 按需下载
 ├── net/
 │   ├── WebhookSender.kt         # Webhook 摘要推送
 │   ├── DiffUploader.kt          # Skill 执行引擎（多步骤 + 占位符 + 差分）
@@ -343,10 +428,17 @@ App 在设置页提供了「从最近任务隐藏」开关（默认关闭 = 显�
 
 ```powershell
 cd E:\source\typevault
+
+# Debug 版
 .\gradlew.bat assembleDebug
+# 产物：app\build\outputs\apk\debug\app-debug.apk
+
+# Release 版（推荐，使用 debug 签名方便直接安装）
+.\gradlew.bat assembleRelease
+# 产物：app\build\outputs\apk\release\app-release.apk
 ```
 
-产物：`app\build\outputs\apk\debug\app-debug.apk`
+> 如遇 Gradle 缓存锁定问题，可加 `--no-daemon --no-build-cache --max-workers=1` 参数。
 
 ## 技术参数
 
@@ -360,4 +452,5 @@ cd E:\source\typevault
 1. **仅文本**：图片/语音/文件内容无法获取
 2. **输入捕获依赖 IME**：部分 app 的自定义输入框可能不触发 TEXT_CHANGED 事件
 3. **通知内容隐藏**：部分 IM 锁屏状态下隐藏通知内容
-4. **MCP 安全性**：无认证机制，确保只在可信网络中使用（公网隧道 URL 随机但公开）
+4. **公网隧道 URL 公开**：trycloudflare 临时隧道 URL 无认证，公网可访问（已支持 Bearer Token 认证，建议开启）
+5. **Shizuku 依赖**：cloudflared 二进制需要 Shizuku 以 shell 权限运行（Android 10+ 限制）
