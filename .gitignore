@@ -1,0 +1,17 @@
+*.iml
+.gradle/
+.gradle-home/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+wrapper-tmp/
+.wrapper-tmp/
+*.apk
+!app/build/outputs/apk/debug/app-debug.apk
+.kotlin/
+gradle
+build_output_*.txt
