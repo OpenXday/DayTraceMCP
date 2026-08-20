@@ -53,6 +53,9 @@ object ShizukuHelper {
      *
      * Shizuku 13.x SDK 中 newProcess 是公开 static 方法:
      *   public static Process newProcess(String[] cmd, String[] env, String dir)
+     *
+     * 注意：此方法会阻塞等待命令完成。对于 `nohup ... &` 等后台命令，
+     * 请使用 [execShellAsync] 避免阻塞。
      */
     fun execShell(command: String): Result<String> {
         return try {
@@ -95,6 +98,22 @@ object ShizukuHelper {
             Log.e(TAG, "execShell failed: ${e.message}", e)
             Result.failure(e)
         }
+    }
+
+    /**
+     * 通过 Shizuku 执行后台 shell 命令（不阻塞等待）
+     *
+     * 专门用于 `nohup ... &` 等后台启动命令。
+     * 不会等待进程完成，立即返回。输出由调用者通过日志文件读取。
+     *
+     * 实现方式：将命令包装在 `sh -c 'cmd; echo DONE_$?'` 中，
+     * 并通过 `execShell` 执行——确保 shell 本身会立即退出。
+     */
+    fun execShellAsync(command: String): Result<String> {
+        // 用 execShell 执行后台命令，但确保 shell 立即退出
+        // 注意：`&` 后面不能跟 `;`（shell 语法错误），用换行符分隔
+        val wrappedCmd = "$command\necho \"STARTED:$?\""
+        return execShell(wrappedCmd)
     }
 
     /**

@@ -25,8 +25,10 @@ class McpServerService : Service() {
 
     companion object {
         private const val TAG = "DayTrace/McpService"
-        private const val CHANNEL_ID = "DayTrace_mcp"
-        private const val NOTIF_ID = 9981
+    private const val CHANNEL_ID = "DayTrace_mcp"
+    private const val NOTIF_ID = 9981
+    private const val TUNNEL_NOTIF_ID = 9982
+    private const val TUNNEL_CHANNEL_ID = "DayTrace_tunnel"
 
         @Volatile var isRunning = false
             private set
@@ -93,11 +95,65 @@ class McpServerService : Service() {
             val ok = CloudflareTunnelManager.start(this@McpServerService, port)
             val url = CloudflareTunnelManager.tunnelUrl
             if (ok && url.isNotEmpty()) {
+                // 更新前台通知
                 updateNotification("MCP Server :$port | Tunnel: $url")
+                // 发送高优先级通知提醒用户
+                sendTunnelReadyNotification(url)
+                // 复制到剪贴板
+                val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+                clipboard?.setPrimaryClip(
+                    android.content.ClipData.newPlainText("Tunnel URL", "$url/mcp")
+                )
             } else {
                 val err = CloudflareTunnelManager.lastError ?: "未知错误"
                 updateNotification("MCP Server :$port | Tunnel 失败: $err")
+                sendTunnelErrorNotification(err)
             }
+        }
+    }
+
+    /** 隧道建立成功的高优先级通知 */
+    private fun sendTunnelReadyNotification(url: String) {
+        createTunnelNotificationChannel()
+        val fullUrl = "$url/mcp"
+        val notification = Notification.Builder(this, TUNNEL_CHANNEL_ID)
+            .setContentTitle("🌐 隧道已建立")
+            .setContentText(fullUrl)
+            .setStyle(Notification.BigTextStyle().bigText(fullUrl))
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setPriority(Notification.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(TUNNEL_NOTIF_ID, notification)
+    }
+
+    /** 隧道建立失败通知 */
+    private fun sendTunnelErrorNotification(error: String) {
+        createTunnelNotificationChannel()
+        val notification = Notification.Builder(this, TUNNEL_CHANNEL_ID)
+            .setContentTitle("⚠️ 隧道建立失败")
+            .setContentText(error)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setPriority(Notification.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(TUNNEL_NOTIF_ID, notification)
+    }
+
+    private fun createTunnelNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                TUNNEL_CHANNEL_ID,
+                "DayTrace Tunnel",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Cloudflare tunnel status notifications"
+                enableVibration(true)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
         }
     }
 
@@ -115,6 +171,8 @@ class McpServerService : Service() {
             } else if (!Prefs.isTunnelEnabled(this) && CloudflareTunnelManager.isRunning) {
                 CloudflareTunnelManager.stop()
                 updateNotification("MCP Server running on port $mcpPort")
+                // 取消隧道通知
+                getSystemService(NotificationManager::class.java)?.cancel(TUNNEL_NOTIF_ID)
             }
         }
         return START_STICKY

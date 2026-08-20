@@ -14,3 +14,4 @@ wrapper-tmp/
 !app/build/outputs/apk/debug/app-debug.apk
 .kotlin/
 gradle
+build_output_*.txt

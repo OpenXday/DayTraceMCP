@@ -84,6 +84,32 @@ class McpServer(
             return resp
         }
 
+        // 安全认证：如果启用了 Token，校验 Authorization header
+        val authEnabled = com.daytrace.util.Prefs.isMcpAuthEnabled(context)
+        if (authEnabled) {
+            val expectedToken = com.daytrace.util.Prefs.getMcpToken(context)
+            if (expectedToken.isNotEmpty()) {
+                val authHeader = session.headers["authorization"] ?: ""
+                val providedToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
+                    authHeader.substring(7).trim()
+                } else {
+                    // 也支持 query parameter ?token=xxx
+                    val params = session.parameters ?: mapOf()
+                    params["token"]?.firstOrNull() ?: ""
+                }
+                if (providedToken != expectedToken) {
+                    val resp = newFixedLengthResponse(
+                        Response.Status.UNAUTHORIZED,
+                        "application/json",
+                        """{"error":"Unauthorized","message":"Invalid or missing Bearer token"}"""
+                    )
+                    resp.addHeader("WWW-Authenticate", "Bearer realm=\"DayTrace MCP\"")
+                    addCorsHeaders(resp)
+                    return resp
+                }
+            }
+        }
+
         // Health check
         if (uri == "/" && method == Method.GET) {
             val health = buildJsonObject {
@@ -91,6 +117,7 @@ class McpServer(
                 put("server", "DayTrace MCP")
                 put("version", "0.1.0")
                 put("port", getListeningPort())
+                put("authRequired", authEnabled)
             }
             return jsonResponse(health.toString())
         }

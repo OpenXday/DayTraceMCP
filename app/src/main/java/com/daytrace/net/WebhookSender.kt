@@ -43,9 +43,9 @@ object WebhookSender {
 
     private val client by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.SECONDS)
-            .writeTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
             .build()
     }
 
@@ -55,6 +55,10 @@ object WebhookSender {
 
     /**
      * 推送当天时间线摘要
+     *
+     * 一次性推送完整内容，不分段。
+     * 标题按日期+时间段命名（如 "DayTrace 2026-08-20 时间线_09-30-00"）。
+     *
      * @param dateMillis 该日期的任意时间点
      */
     fun pushDaySummary(context: Context, dateMillis: Long = System.currentTimeMillis()) {
@@ -71,15 +75,11 @@ object WebhookSender {
                 }
 
                 val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date(dateMillis))
-                // 截取前 4000 字符（Chanify 有长度限制）
-                val summary = if (markdown.length > 4000) {
-                    markdown.substring(0, 4000) + "\n\n...(已截断，完整内容请通过 MCP 查看)"
-                } else {
-                    markdown
-                }
+                val timeStr = SimpleDateFormat("HH-mm-ss", Locale.CHINA).format(Date())
+                val title = "DayTrace_${dateStr}_$timeStr"
 
-                pushText(url, Prefs.getWebhookToken(context), "DayTrace $dateStr 时间线", summary)
-                Log.i(TAG, "Day summary pushed for $dateStr")
+                pushText(url, Prefs.getWebhookToken(context), title, markdown)
+                Log.i(TAG, "Day summary pushed for $dateStr (${markdown.length} chars)")
             } catch (e: Exception) {
                 Log.e(TAG, "pushDaySummary failed: ${e.message}")
             }

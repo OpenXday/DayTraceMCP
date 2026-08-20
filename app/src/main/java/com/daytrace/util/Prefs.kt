@@ -15,8 +15,10 @@ object Prefs {
     private const val KEY_WEBHOOK_PER_MESSAGE = "webhook_per_message"
 
     // MCP Server
-    private const val KEY_MCP_ENABLED = "mcp_enabled"
-    private const val KEY_MCP_PORT = "mcp_port"
+private const val KEY_MCP_ENABLED = "mcp_enabled"
+private const val KEY_MCP_PORT = "mcp_port"
+private const val KEY_MCP_AUTH_ENABLED = "mcp_auth_enabled"
+private const val KEY_MCP_TOKEN = "mcp_token"
 
     // === Skill 驱动上传 ===
     private const val KEY_UPLOAD_ENABLED = "upload_enabled"
@@ -102,6 +104,20 @@ object Prefs {
 
     fun setMcpPort(ctx: Context, port: Int) {
         prefs(ctx).edit().putInt(KEY_MCP_PORT, port).apply()
+    }
+
+    fun isMcpAuthEnabled(ctx: Context): Boolean =
+        prefs(ctx).getBoolean(KEY_MCP_AUTH_ENABLED, false)
+
+    fun setMcpAuthEnabled(ctx: Context, enabled: Boolean) {
+        prefs(ctx).edit().putBoolean(KEY_MCP_AUTH_ENABLED, enabled).apply()
+    }
+
+    fun getMcpToken(ctx: Context): String =
+        prefs(ctx).getString(KEY_MCP_TOKEN, "") ?: ""
+
+    fun setMcpToken(ctx: Context, token: String) {
+        prefs(ctx).edit().putString(KEY_MCP_TOKEN, token).apply()
     }
 
     // === Skill 驱动上传 ===

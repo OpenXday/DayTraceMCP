@@ -43,6 +43,8 @@ fun SettingsScreen() {
 
     var mcpEnabled by remember { mutableStateOf(Prefs.isMcpEnabled(context)) }
     var mcpPort by remember { mutableStateOf(Prefs.getMcpPort(context).toString()) }
+    var mcpAuthEnabled by remember { mutableStateOf(Prefs.isMcpAuthEnabled(context)) }
+    var mcpToken by remember { mutableStateOf(Prefs.getMcpToken(context)) }
 
     val mcpRunning = McpServerService.isRunning
     val mcpActualPort = McpServerService.mcpPort
@@ -55,6 +57,26 @@ fun SettingsScreen() {
     var binaryReady by remember { mutableStateOf(CloudflareTunnelManager.isBinaryReady(context)) }
     var binaryDownloading by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableStateOf(0) }
+    val shizukuAvailable = remember { CloudflareTunnelManager.isShizukuAvailable() }
+
+    // 轮询隧道状态更新 UI（不依赖 UI scope，用 LaunchedEffect 自动管理）
+    LaunchedEffect(tunnelStarting) {
+        while (tunnelStarting) {
+            kotlinx.coroutines.delay(2000)
+            tunnelRunning = CloudflareTunnelManager.isRunning
+            tunnelUrl = CloudflareTunnelManager.tunnelUrl
+            if (CloudflareTunnelManager.tunnelUrl.isNotEmpty()) {
+                tunnelStarting = false
+                tunnelRunning = true
+            } else if (CloudflareTunnelManager.lastError != null && !CloudflareTunnelManager.isRunning) {
+                tunnelStarting = false
+                val err = CloudflareTunnelManager.lastError
+                if (err != null) {
+                    Toast.makeText(context, "隧道启动失败: $err", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
 
     // Skill 驱动上传
     var uploadEnabled by remember { mutableStateOf(Prefs.isUploadEnabled(context)) }
@@ -265,6 +287,81 @@ fun SettingsScreen() {
                             ) { Text("应用") }
                         }
 
+                        // 安全认证
+                        HorizontalDivider(color = Color(0xFF333344))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("安全认证", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                Text(
+                                    "启用后，请求需携带 Authorization: Bearer <token>",
+                                    fontSize = 10.sp, color = Color.Gray
+                                )
+                            }
+                            Switch(
+                                checked = mcpAuthEnabled,
+                                onCheckedChange = {
+                                    mcpAuthEnabled = it
+                                    Prefs.setMcpAuthEnabled(context, it)
+                                }
+                            )
+                        }
+                        if (mcpAuthEnabled) {
+                            OutlinedTextField(
+                                value = mcpToken,
+                                onValueChange = {
+                                    mcpToken = it
+                                    Prefs.setMcpToken(context, it)
+                                },
+                                label = { Text("Bearer Token") },
+                                placeholder = { Text("输入自定义 Token") },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                visualTransformation = PasswordVisualTransformation()
+                            )
+                            if (mcpToken.isBlank()) {
+                                Text("⚠️ Token 为空，认证不会生效", fontSize = 11.sp, color = Color(0xFFF9E2AF))
+                            } else if (mcpRunning) {
+                                Surface(
+                                    color = Color(0xFF111122),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "客户端配置 Header:",
+                                            fontSize = 11.sp,
+                                            color = Color(0xFFAAAAAA)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            "Authorization: Bearer $mcpToken",
+                                            fontSize = 11.sp,
+                                            color = Color(0xFF89B4FA),
+                                            fontFamily = FontFamily.Monospace,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Text(
+                                            "📋",
+                                            fontSize = 16.sp,
+                                            modifier = Modifier.clickable {
+                                                val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                                                clipboard?.setPrimaryClip(
+                                                    android.content.ClipData.newPlainText(
+                                                        "MCP Auth Header",
+                                                        "Authorization: Bearer $mcpToken"
+                                                    )
+                                                )
+                                                Toast.makeText(context, "已复制认证 Header", Toast.LENGTH_SHORT).show()
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
                         if (mcpRunning) {
                             Surface(
                                 color = Color(0xFF1E2E1E),
@@ -300,22 +397,14 @@ fun SettingsScreen() {
                                                 Prefs.setTunnelEnabled(context, false)
                                                 return@Switch
                                             }
+                                            // 委托给 McpServerService 管理隧道生命周期
+                                            // Service 用自己的 CoroutineScope，不依赖 UI 生命周期
                                             tunnelStarting = true
-                                            scope.launch {
-                                                val ok = CloudflareTunnelManager.start(context, mcpActualPort)
-                                                tunnelStarting = false
-                                                tunnelRunning = CloudflareTunnelManager.isRunning
-                                                tunnelUrl = CloudflareTunnelManager.tunnelUrl
-                                                if (ok && tunnelUrl.isNotEmpty()) {
-                                                    Toast.makeText(context, "隧道已启动: $tunnelUrl", Toast.LENGTH_LONG).show()
-                                                } else {
-                                                    val err = CloudflareTunnelManager.lastError ?: "启动失败"
-                                                    Toast.makeText(context, "隧道启动失败: $err", Toast.LENGTH_LONG).show()
-                                                }
-                                            }
+                                            McpServerService.refreshTunnel(context)
                                         } else {
-                                            CloudflareTunnelManager.stop()
+                                            McpServerService.refreshTunnel(context)
                                             tunnelRunning = false
+                                            tunnelStarting = false
                                             tunnelUrl = ""
                                             Toast.makeText(context, "隧道已关闭", Toast.LENGTH_SHORT).show()
                                         }
@@ -342,6 +431,23 @@ fun SettingsScreen() {
                                             "设备架构: ${CloudflareTunnelManager.getDeviceAbi()}",
                                             fontSize = 10.sp, color = Color(0xFF6C7086)
                                         )
+                                        // Shizuku 状态提示
+                                        if (!shizukuAvailable) {
+                                            Spacer(modifier = Modifier.height(6.dp))
+                                            Surface(
+                                                color = Color(0xFF331111),
+                                                shape = RoundedCornerShape(6.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Column(modifier = Modifier.padding(8.dp)) {
+                                                    Text("⚠️ 需要 Shizuku", fontSize = 11.sp, color = Color(0xFFF38BA8), fontWeight = FontWeight.Bold)
+                                                    Text(
+                                                        "Android 10+ 不允许直接执行二进制文件，需要 Shizuku 以 shell 权限运行 cloudflared。请先在首页授权 Shizuku。",
+                                                        fontSize = 10.sp, color = Color(0xFFAAAAAA)
+                                                    )
+                                                }
+                                            }
+                                        }
                                         Spacer(modifier = Modifier.height(8.dp))
                                         if (binaryDownloading) {
                                             Column {
@@ -413,24 +519,52 @@ fun SettingsScreen() {
                                         color = Color(0xFFF9E2AF)
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text("正在建立隧道... (最多 30 秒)", fontSize = 12.sp, color = Color(0xFFF9E2AF))
+                                    Text("正在建立隧道... (最多 60 秒)", fontSize = 12.sp, color = Color(0xFFF9E2AF))
                                 }
                             } else if (tunnelRunning && tunnelUrl.isNotEmpty()) {
+                                val fullUrl = "$tunnelUrl/mcp"
                                 Surface(
                                     color = Color(0xFF1E2E1E),
                                     shape = RoundedCornerShape(8.dp),
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Column(modifier = Modifier.padding(12.dp)) {
-                                        Text("🌐 公网地址", color = Color(0xFFA6E3A1), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Text(
-                                            "$tunnelUrl/mcp",
-                                            fontSize = 12.sp,
-                                            color = Color(0xFF89B4FA),
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text("🌐 公网地址", color = Color(0xFFA6E3A1), fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                            Text("● 运行中", color = Color(0xFFA6E3A1), fontSize = 10.sp)
+                                        }
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Surface(
+                                            color = Color(0xFF161620),
+                                            shape = RoundedCornerShape(6.dp),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    fullUrl,
+                                                    fontSize = 12.sp,
+                                                    color = Color(0xFF89B4FA),
+                                                    fontFamily = FontFamily.Monospace,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Text(
+                                                    "📋",
+                                                    fontSize = 16.sp,
+                                                    modifier = Modifier.clickable {
+                                                        val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                                                        clipboard?.setPrimaryClip(
+                                                            android.content.ClipData.newPlainText("Tunnel URL", fullUrl)
+                                                        )
+                                                        Toast.makeText(context, "已复制: $fullUrl", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                )
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.height(6.dp))
                                         Text(
                                             "在外部设备访问此地址即可使用 MCP，每次启动 URL 会变",
                                             fontSize = 10.sp, color = Color.Gray
@@ -438,7 +572,22 @@ fun SettingsScreen() {
                                     }
                                 }
                             } else if (tunnelEnabled && !tunnelRunning && binaryReady) {
-                                Text("⚠️ 隧道未运行", fontSize = 12.sp, color = Color(0xFFF38BA8))
+                                val err = CloudflareTunnelManager.lastError
+                                if (err != null) {
+                                    Surface(
+                                        color = Color(0xFF2A1E1E),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(modifier = Modifier.padding(12.dp)) {
+                                            Text("⚠️ 隧道启动失败", color = Color(0xFFF38BA8), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(err, fontSize = 10.sp, color = Color(0xFFF38BA8))
+                                        }
+                                    }
+                                } else {
+                                    Text("⚠️ 隧道未运行", fontSize = 12.sp, color = Color(0xFFF38BA8))
+                                }
                             }
                         } else {
                             Text("⏳ 服务启动中... 请等待", fontSize = 12.sp, color = Color(0xFFF9E2AF))
@@ -490,209 +639,212 @@ fun SettingsScreen() {
                 }
             }
 
-            // === Skill 驱动差分上传 ===
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E2E))
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+            // === Skill 驱动差分上传（暂时隐藏） ===
+            // 如需恢复，将下面的 false 改为 true
+            if (false) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E2E))
                 ) {
-                    Text("差分上传", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text(
-                        "选择上传 Skill 并填入凭证，每次上传只发送增量内容，按日期+时间命名防止覆盖",
-                        fontSize = 12.sp, color = Color.Gray
-                    )
-
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("启用上传", modifier = Modifier.weight(1f), fontSize = 14.sp)
-                        Switch(
-                            checked = uploadEnabled,
-                            onCheckedChange = {
-                                uploadEnabled = it
-                                Prefs.setUploadEnabled(context, it)
-                            }
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text("差分上传", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Text(
+                            "选择上传 Skill 并填入凭证，每次上传只发送增量内容，按日期+时间命名防止覆盖",
+                            fontSize = 12.sp, color = Color.Gray
                         )
-                    }
 
-                    if (uploadEnabled) {
-                        // Skill 选择器
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("选择上传服务", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.weight(1f))
-                            TextButton(onClick = { showImportDialog = true }) {
-                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("导入 Skill", fontSize = 12.sp)
-                            }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("启用上传", modifier = Modifier.weight(1f), fontSize = 14.sp)
+                            Switch(
+                                checked = uploadEnabled,
+                                onCheckedChange = {
+                                    uploadEnabled = it
+                                    Prefs.setUploadEnabled(context, it)
+                                }
+                            )
                         }
-                        allSkills.forEach { skill ->
+
+                        if (uploadEnabled) {
+                            // Skill 选择器
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        selectedSkillId = skill.id
-                                        Prefs.setUploadSkillId(context, skill.id)
-                                    }
-                            ) {
-                                RadioButton(
-                                    selected = selectedSkillId == skill.id,
-                                    onClick = {
-                                        selectedSkillId = skill.id
-                                        Prefs.setUploadSkillId(context, skill.id)
-                                    }
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(skill.name, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                                        if (skill.isImported) {
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Surface(color = Color(0xFF313244), shape = RoundedCornerShape(4.dp)) {
-                                                Text("导入", fontSize = 9.sp, color = Color(0xFF89B4FA), modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
-                                            }
-                                        }
-                                    }
-                                    Text(skill.description, fontSize = 10.sp, color = Color.Gray)
-                                }
-                                if (skill.isImported) {
-                                    IconButton(onClick = {
-                                        SkillManager.deleteSkill(context, skill.id)
-                                        Toast.makeText(context, "已删除 ${skill.name}", Toast.LENGTH_SHORT).show()
-                                    }) {
-                                        Icon(Icons.Default.Delete, contentDescription = "删除", tint = Color(0xFFF38BA8), modifier = Modifier.size(18.dp))
-                                    }
-                                }
-                            }
-                        }
-
-                        HorizontalDivider(color = Color(0xFF333344))
-
-                        // 凭证输入
-                        Text("${selectedSkill.name} 配置", fontSize = 12.sp, color = Color.Gray)
-                        selectedSkill.credentials.forEach { cred ->
-                            val credValue = remember(selectedSkillId, cred.id) {
-                                mutableStateOf(credentials[cred.id] ?: "")
-                            }
-                            OutlinedTextField(
-                                value = credValue.value,
-                                onValueChange = {
-                                    credValue.value = it
-                                    credentials[cred.id] = it
-                                    Prefs.setSkillCredential(context, selectedSkill.id, cred.id, it)
-                                },
-                                label = { Text(cred.label) },
-                                placeholder = { Text(cred.placeholder) },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true,
-                                visualTransformation = if (cred.isSecret) PasswordVisualTransformation() else VisualTransformation.None
-                            )
-                        }
-                        if (selectedSkill.credentials.isEmpty()) {
-                            Text("该 Skill 无需配置凭证", fontSize = 11.sp, color = Color.Gray)
-                        }
-
-                        // 定时上传
-                        HorizontalDivider(color = Color(0xFF333344))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("定时自动上传", modifier = Modifier.weight(1f), fontSize = 14.sp)
-                            Switch(
-                                checked = uploadAutoScheduled,
-                                onCheckedChange = {
-                                    uploadAutoScheduled = it
-                                    Prefs.setUploadAutoScheduled(context, it)
-                                    if (it) {
-                                        UploadScheduler.scheduleAll(context)
-                                        Toast.makeText(context, "定时上传已开启", Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        UploadScheduler.cancelAll(context)
-                                        Toast.makeText(context, "定时上传已关闭", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            )
-                        }
-                        if (uploadAutoScheduled) {
-                            OutlinedTextField(
-                                value = uploadTimes,
-                                onValueChange = {
-                                    uploadTimes = it
-                                    val times = it.split(",").map { t -> t.trim() }.filter { t -> t.isNotEmpty() }
-                                    Prefs.setUploadTimes(context, times)
-                                },
-                                label = { Text("上传时间点（逗号分隔）") },
-                                placeholder = { Text("09:00, 12:00, 18:00, 23:00") },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true
-                            )
-                            Text(
-                                "每个时间点自动上传差分内容，按日期+时间命名防止覆盖",
-                                fontSize = 10.sp, color = Color.Gray
-                            )
-                        }
-
-                        // 手动操作
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = {
-                                    uploadTesting = true
-                                    scope.launch {
-                                        val result = DiffUploader.uploadDayDiff(context)
-                                        uploadTesting = false
-                                        uploadProgress = DiffUploader.getUploadProgress(context, System.currentTimeMillis())
-                                        Toast.makeText(context, result.message, Toast.LENGTH_SHORT).show()
-                                    }
-                                },
-                                enabled = !uploadTesting
-                            ) {
-                                if (uploadTesting) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp,
-                                        color = Color.White
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("上传中...")
-                                } else {
-                                    Text("立即上传")
-                                }
-                            }
-                            OutlinedButton(
-                                onClick = {
-                                    scope.launch {
-                                        val (ok, msg) = DiffUploader.testSkill(context)
-                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            ) { Text("测试连接") }
-                            OutlinedButton(
-                                onClick = {
-                                    scope.launch {
-                                        DiffUploader.resetDayOffset(context, System.currentTimeMillis())
-                                        uploadProgress = DiffUploader.getUploadProgress(context, System.currentTimeMillis())
-                                        Toast.makeText(context, "已重置偏移，下次将全量上传", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            ) { Text("重置差分") }
-                        }
-
-                        // 上传进度
-                        uploadProgress?.let { prog ->
-                            Surface(
-                                color = Color(0xFF111122),
-                                shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Text("上传进度", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text("日期: ${prog.dateStr}", fontSize = 11.sp, color = Color(0xFFAAAAAA))
-                                    Text("已上传: ${prog.uploadedOffset} / ${prog.totalSize} 字节 (${prog.progressPercent}%)", fontSize = 11.sp, color = Color(0xFFAAAAAA))
-                                    if (prog.isComplete) {
-                                        Text("✓ 全部已上传", fontSize = 11.sp, color = Color(0xFFA6E3A1))
+                                Text("选择上传服务", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.weight(1f))
+                                TextButton(onClick = { showImportDialog = true }) {
+                                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("导入 Skill", fontSize = 12.sp)
+                                }
+                            }
+                            allSkills.forEach { skill ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            selectedSkillId = skill.id
+                                            Prefs.setUploadSkillId(context, skill.id)
+                                        }
+                                ) {
+                                    RadioButton(
+                                        selected = selectedSkillId == skill.id,
+                                        onClick = {
+                                            selectedSkillId = skill.id
+                                            Prefs.setUploadSkillId(context, skill.id)
+                                        }
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(skill.name, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                            if (skill.isImported) {
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Surface(color = Color(0xFF313244), shape = RoundedCornerShape(4.dp)) {
+                                                    Text("导入", fontSize = 9.sp, color = Color(0xFF89B4FA), modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
+                                                }
+                                            }
+                                        }
+                                        Text(skill.description, fontSize = 10.sp, color = Color.Gray)
+                                    }
+                                    if (skill.isImported) {
+                                        IconButton(onClick = {
+                                            SkillManager.deleteSkill(context, skill.id)
+                                            Toast.makeText(context, "已删除 ${skill.name}", Toast.LENGTH_SHORT).show()
+                                        }) {
+                                            Icon(Icons.Default.Delete, contentDescription = "删除", tint = Color(0xFFF38BA8), modifier = Modifier.size(18.dp))
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalDivider(color = Color(0xFF333344))
+
+                            // 凭证输入
+                            Text("${selectedSkill.name} 配置", fontSize = 12.sp, color = Color.Gray)
+                            selectedSkill.credentials.forEach { cred ->
+                                val credValue = remember(selectedSkillId, cred.id) {
+                                    mutableStateOf(credentials[cred.id] ?: "")
+                                }
+                                OutlinedTextField(
+                                    value = credValue.value,
+                                    onValueChange = {
+                                        credValue.value = it
+                                        credentials[cred.id] = it
+                                        Prefs.setSkillCredential(context, selectedSkill.id, cred.id, it)
+                                    },
+                                    label = { Text(cred.label) },
+                                    placeholder = { Text(cred.placeholder) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    singleLine = true,
+                                    visualTransformation = if (cred.isSecret) PasswordVisualTransformation() else VisualTransformation.None
+                                )
+                            }
+                            if (selectedSkill.credentials.isEmpty()) {
+                                Text("该 Skill 无需配置凭证", fontSize = 11.sp, color = Color.Gray)
+                            }
+
+                            // 定时上传
+                            HorizontalDivider(color = Color(0xFF333344))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("定时自动上传", modifier = Modifier.weight(1f), fontSize = 14.sp)
+                                Switch(
+                                    checked = uploadAutoScheduled,
+                                    onCheckedChange = {
+                                        uploadAutoScheduled = it
+                                        Prefs.setUploadAutoScheduled(context, it)
+                                        if (it) {
+                                            UploadScheduler.scheduleAll(context)
+                                            Toast.makeText(context, "定时上传已开启", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            UploadScheduler.cancelAll(context)
+                                            Toast.makeText(context, "定时上传已关闭", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                )
+                            }
+                            if (uploadAutoScheduled) {
+                                OutlinedTextField(
+                                    value = uploadTimes,
+                                    onValueChange = {
+                                        uploadTimes = it
+                                        val times = it.split(",").map { t -> t.trim() }.filter { t -> t.isNotEmpty() }
+                                        Prefs.setUploadTimes(context, times)
+                                    },
+                                    label = { Text("上传时间点（逗号分隔）") },
+                                    placeholder = { Text("09:00, 12:00, 18:00, 23:00") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    singleLine = true
+                                )
+                                Text(
+                                    "每个时间点自动上传差分内容，按日期+时间命名防止覆盖",
+                                    fontSize = 10.sp, color = Color.Gray
+                                )
+                            }
+
+                            // 手动操作
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {
+                                        uploadTesting = true
+                                        scope.launch {
+                                            val result = DiffUploader.uploadDayDiff(context)
+                                            uploadTesting = false
+                                            uploadProgress = DiffUploader.getUploadProgress(context, System.currentTimeMillis())
+                                            Toast.makeText(context, result.message, Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    enabled = !uploadTesting
+                                ) {
+                                    if (uploadTesting) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                            color = Color.White
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("上传中...")
+                                    } else {
+                                        Text("立即上传")
+                                    }
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        scope.launch {
+                                            val (ok, msg) = DiffUploader.testSkill(context)
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                ) { Text("测试连接") }
+                                OutlinedButton(
+                                    onClick = {
+                                        scope.launch {
+                                            DiffUploader.resetDayOffset(context, System.currentTimeMillis())
+                                            uploadProgress = DiffUploader.getUploadProgress(context, System.currentTimeMillis())
+                                            Toast.makeText(context, "已重置偏移，下次将全量上传", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                ) { Text("重置差分") }
+                            }
+
+                            // 上传进度
+                            uploadProgress?.let { prog ->
+                                Surface(
+                                    color = Color(0xFF111122),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text("上传进度", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text("日期: ${prog.dateStr}", fontSize = 11.sp, color = Color(0xFFAAAAAA))
+                                        Text("已上传: ${prog.uploadedOffset} / ${prog.totalSize} 字节 (${prog.progressPercent}%)", fontSize = 11.sp, color = Color(0xFFAAAAAA))
+                                        if (prog.isComplete) {
+                                            Text("✓ 全部已上传", fontSize = 11.sp, color = Color(0xFFA6E3A1))
+                                        }
                                     }
                                 }
                             }
