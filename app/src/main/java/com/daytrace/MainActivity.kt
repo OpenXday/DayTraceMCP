@@ -33,6 +33,7 @@ import com.daytrace.data.MessageEntry
 import com.daytrace.service.CaptureAccessibilityService
 import com.daytrace.service.NotificationCaptureService
 import com.daytrace.ui.HistoryScreen
+import com.daytrace.ui.McpLogScreen
 import com.daytrace.ui.SettingsScreen
 import com.daytrace.util.Prefs
 import com.daytrace.util.ShizukuHelper
@@ -91,6 +92,7 @@ class MainActivity : ComponentActivity() {
 sealed class Screen(val route: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
     data object Home : Screen("home", "首页", Icons.Default.Home)
     data object History : Screen("history", "时间线", Icons.Default.Schedule)
+    data object McpLog : Screen("mcplog", "MCP日志", Icons.Default.Analytics)
     data object Settings : Screen("settings", "设置", Icons.Default.Settings)
 }
 
@@ -98,7 +100,7 @@ sealed class Screen(val route: String, val label: String, val icon: androidx.com
 @Composable
 fun DayTraceRoot() {
     val navController = rememberNavController()
-    val screens = listOf(Screen.Home, Screen.History, Screen.Settings)
+    val screens = listOf(Screen.Home, Screen.History, Screen.McpLog, Screen.Settings)
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
@@ -146,6 +148,7 @@ fun DayTraceRoot() {
         ) {
             composable(Screen.Home.route) { HomeScreen() }
             composable(Screen.History.route) { HistoryScreen() }
+            composable(Screen.McpLog.route) { McpLogScreen() }
             composable(Screen.Settings.route) { SettingsScreen() }
         }
     }

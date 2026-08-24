@@ -2,6 +2,7 @@ package com.daytrace.server
 
 import android.content.Context
 import android.util.Log
+import com.daytrace.data.McpLogEntry
 import com.daytrace.data.MessageEntry
 import com.daytrace.export.TimelineExporter
 import fi.iki.elonen.NanoHTTPD
@@ -37,6 +38,8 @@ import java.util.concurrent.ConcurrentHashMap
  *   DELETE /mcp        (终止会话)
  *   GET    /           (健康检查)
  *   GET    /mcp/tools  (工具列表，便利端点)
+ *
+ * 所有 MCP 调用均通过 [logRecorder] 异步写入 mcp_logs 表，可在 App 内审计。
  */
 class McpServer(
     private val context: Context,
@@ -65,6 +68,11 @@ class McpServer(
         (context.applicationContext as com.daytrace.DayTraceApp).database.messageDao()
     }
 
+    /** MCP 调用日志记录器（异步写入数据库，不阻塞请求处理） */
+    private val logRecorder by lazy {
+        McpLogRecorder(context)
+    }
+
     fun startServer() {
         try {
             start(SOCKET_READ_TIMEOUT, false)
@@ -85,13 +93,46 @@ class McpServer(
 
     fun getPort(): Int = getListeningPort()
 
+/**
+ * 提取客户端真实 IP
+ *
+ * 当请求通过 Cloudflare Tunnel 或反向代理到达时，NanoHTTPD 的
+ * remote-addr 会是 127.0.0.1（隧道本地回环）。此时需要从代理
+ * 转发的 header 中提取真实客户端 IP。
+ *
+ * 优先级（从高到低）：
+ * 1. CF-Connecting-IP — Cloudflare 隧道直接写入的真实 IP（单个，无逗号）
+ * 2. X-Real-IP — Nginx 等反向代理设置的真实 IP
+ * 3. X-Forwarded-For — 标准代理 header，可能含多个 IP（第一个是原始客户端）
+ * 4. remote-addr — NanoHTTPD 的直接连接 IP（无代理时为真实客户端）
+ * 5. unknown — 兜底
+ */
+private fun getClientIp(session: IHTTPSession): String {
+    // Cloudflare 隧道直接写入的客户端真实 IP
+    session.headers["cf-connecting-ip"]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    // X-Real-IP（Nginx 等设置）
+    session.headers["x-real-ip"]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    // X-Forwarded-For（可能逗号分隔，取第一个）
+    session.headers["x-forwarded-for"]
+        ?.split(",")
+        ?.firstOrNull()
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { return it }
+    // 直接连接 IP（无代理场景）
+    session.headers["remote-addr"]?.takeIf { it.isNotEmpty() }?.let { return it }
+    return "unknown"
+}
+
     // === NanoHTTPD HTTP handler ===
 
     override fun serve(session: IHTTPSession): Response {
+        val requestStartTime = System.currentTimeMillis()
         val uri = session.uri
         val method = session.method
+        val clientIp = getClientIp(session)
 
-        // CORS preflight
+        // CORS preflight（不记录日志）
         if (method == Method.OPTIONS) {
             val resp = newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "")
             addCorsHeaders(resp)
@@ -100,9 +141,11 @@ class McpServer(
 
         // 安全认证：如果启用了 Token，校验 Authorization header
         val authEnabled = com.daytrace.util.Prefs.isMcpAuthEnabled(context)
+        var authResult = McpLogEntry.AUTH_NOT_REQUIRED
         if (authEnabled) {
             val expectedToken = com.daytrace.util.Prefs.getMcpToken(context)
             if (expectedToken.isNotEmpty()) {
+                authResult = McpLogEntry.AUTH_OK
                 val authHeader = session.headers["authorization"] ?: ""
                 val providedToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
                     authHeader.substring(7).trim()
@@ -112,6 +155,7 @@ class McpServer(
                     params["token"]?.firstOrNull() ?: ""
                 }
                 if (providedToken != expectedToken) {
+                    authResult = McpLogEntry.AUTH_FAILED
                     val resp = newFixedLengthResponse(
                         Response.Status.UNAUTHORIZED,
                         "application/json",
@@ -119,9 +163,28 @@ class McpServer(
                     )
                     resp.addHeader("WWW-Authenticate", "Bearer realm=\"DayTrace MCP\"")
                     addCorsHeaders(resp)
+                    // 记录认证失败日志
+                    logRecorder.log(
+                        httpMethod = method.name,
+                        httpPath = uri,
+                        clientIp = clientIp,
+                        responseCode = 401,
+                        durationMs = System.currentTimeMillis() - requestStartTime,
+                        rpcMethod = "",
+                        sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: "",
+                        authResult = authResult,
+                        requestBody = "",
+                        responseBody = """{"error":"Unauthorized","message":"Invalid or missing Bearer token"}""",
+                        success = false,
+                        errorMessage = "Authentication failed: invalid or missing Bearer token"
+                    )
                     return resp
                 }
+            } else {
+                authResult = McpLogEntry.AUTH_NOT_REQUIRED
             }
+        } else {
+            authResult = McpLogEntry.AUTH_NOT_REQUIRED
         }
 
         // Health check
@@ -133,23 +196,58 @@ class McpServer(
                 put("port", getListeningPort())
                 put("authRequired", authEnabled)
             }
-            return jsonResponse(health.toString())
+            val resp = jsonResponse(health.toString())
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = uri,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "health_check",
+                authResult = authResult,
+                responseBody = health.toString(),
+                success = true
+            )
+            return resp
         }
 
         // MCP Streamable HTTP transport endpoint
         if (uri == MCP_ENDPOINT) {
-            return handleMcpEndpoint(session, method)
+            return handleMcpEndpoint(session, method, clientIp, authResult, requestStartTime)
         }
 
         // OpenAPI-style discovery (convenience endpoint)
         if (uri == "/mcp/tools" && method == Method.GET) {
             val tools = listTools()
-            return jsonResponse(tools.toString())
+            val resp = jsonResponse(tools.toString())
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = uri,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "tools_list_endpoint",
+                authResult = authResult,
+                responseBody = tools.toString(),
+                success = true
+            )
+            return resp
         }
 
         // Legacy SSE info endpoint
         if (uri == "/mcp/sse" && method == Method.GET) {
-            return handleSseInfo()
+            val resp = handleSseInfo()
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = uri,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "sse_info",
+                authResult = authResult,
+                success = true
+            )
+            return resp
         }
 
         // 405 for unsupported methods on known paths, 404 for unknown paths
@@ -159,6 +257,18 @@ class McpServer(
             newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found: $uri")
         }
         addCorsHeaders(resp)
+        val respCode = if (uri.startsWith("/mcp")) 405 else 404
+        logRecorder.log(
+            httpMethod = method.name,
+            httpPath = uri,
+            clientIp = clientIp,
+            responseCode = respCode,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "",
+            authResult = authResult,
+            success = false,
+            errorMessage = if (respCode == 405) "Method not allowed" else "Not found"
+        )
         return resp
     }
 
@@ -169,11 +279,17 @@ class McpServer(
      * GET    /mcp — SSE 流（服务器推送事件）
      * DELETE /mcp — 终止会话
      */
-    private fun handleMcpEndpoint(session: IHTTPSession, method: Method): Response {
+    private fun handleMcpEndpoint(
+        session: IHTTPSession,
+        method: Method,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         return when (method) {
-            Method.POST -> handleRpc(session)
-            Method.GET -> handleSseStream(session)
-            Method.DELETE -> handleDeleteSession(session)
+            Method.POST -> handleRpc(session, clientIp, authResult, requestStartTime)
+            Method.GET -> handleSseStream(session, clientIp, authResult, requestStartTime)
+            Method.DELETE -> handleDeleteSession(session, clientIp, authResult, requestStartTime)
             else -> {
                 val resp = newFixedLengthResponse(
                     Response.Status.METHOD_NOT_ALLOWED,
@@ -181,13 +297,29 @@ class McpServer(
                     """{"error":"Method not allowed","message":"Use POST, GET, or DELETE on /mcp"}"""
                 )
                 addCorsHeaders(resp)
+                logRecorder.log(
+                    httpMethod = method.name,
+                    httpPath = MCP_ENDPOINT,
+                    clientIp = clientIp,
+                    responseCode = 405,
+                    durationMs = System.currentTimeMillis() - requestStartTime,
+                    rpcMethod = "",
+                    authResult = authResult,
+                    success = false,
+                    errorMessage = "Method not allowed on /mcp"
+                )
                 resp
             }
         }
     }
 
     /** 处理 DELETE /mcp — 终止会话 */
-    private fun handleDeleteSession(session: IHTTPSession): Response {
+    private fun handleDeleteSession(
+        session: IHTTPSession,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
         if (sessionId.isNotEmpty()) {
             sessions.remove(sessionId)
@@ -195,6 +327,18 @@ class McpServer(
         }
         val resp = newFixedLengthResponse(Response.Status.OK, "application/json", "{}")
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "DELETE",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "session_delete",
+            sessionId = sessionId,
+            authResult = authResult,
+            success = true
+        )
         return resp
     }
 
@@ -205,7 +349,12 @@ class McpServer(
      * 我们返回一个简单的 SSE 流，保持连接并定期发送 ping。
      * 如果客户端没有有效会话，返回 400。
      */
-    private fun handleSseStream(session: IHTTPSession): Response {
+    private fun handleSseStream(
+        session: IHTTPSession,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
         val acceptHeader = session.headers["accept"] ?: ""
 
@@ -217,7 +366,20 @@ class McpServer(
                 put("note", "Use HTTP POST /mcp for JSON-RPC 2.0")
                 put("discovery", "GET /mcp/tools for tool list")
             }
-            return jsonResponse(info.toString())
+            val resp = jsonResponse(info.toString())
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "sse_info",
+                sessionId = sessionId,
+                authResult = authResult,
+                responseBody = info.toString(),
+                success = true
+            )
+            return resp
         }
 
         // 返回 SSE 流
@@ -256,6 +418,18 @@ class McpServer(
         resp.addHeader("Connection", "keep-alive")
         resp.addHeader("X-Accel-Buffering", "no")
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "GET",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "sse_stream",
+            sessionId = sessionId,
+            authResult = authResult,
+            success = true
+        )
         return resp
     }
 
@@ -282,18 +456,50 @@ class McpServer(
         return jsonResponse(info.toString())
     }
 
-    private fun handleRpc(session: IHTTPSession): Response {
+    private fun handleRpc(
+        session: IHTTPSession,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val body = try {
             val files = HashMap<String, String>()
             session.parseBody(files)
             files["postData"] ?: ""
         } catch (e: Exception) {
-            return errorResponse(-32700, "Parse error: ${e.message}", null)
+            val resp = errorResponse(-32700, "Parse error: ${e.message}", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "",
+                authResult = authResult,
+                requestBody = "",
+                success = false,
+                errorMessage = "Parse error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
 
         // 空请求体可能是批量请求或 SSE 初始化
         if (body.isBlank()) {
-            return errorResponse(-32700, "Parse error: empty request body", null)
+            val resp = errorResponse(-32700, "Parse error: empty request body", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "",
+                authResult = authResult,
+                requestBody = "",
+                success = false,
+                errorMessage = "Parse error: empty request body"
+            )
+            return resp
         }
 
         // 检查是否是批量请求（JSON 数组）
@@ -303,13 +509,27 @@ class McpServer(
         val wantsSse = acceptHeader.contains("text/event-stream")
 
         if (isBatchRequest) {
-            return handleBatchRpc(body, session, wantsSse)
+            return handleBatchRpc(body, session, wantsSse, clientIp, authResult, requestStartTime)
         }
 
         val request = try {
             json.parseToJsonElement(body).jsonObject
         } catch (e: Exception) {
-            return errorResponse(-32700, "Parse error: ${e.message}", null)
+            val resp = errorResponse(-32700, "Parse error: ${e.message}", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "",
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Parse error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
 
         val id: JsonElement? = request["id"]
@@ -318,6 +538,11 @@ class McpServer(
 
         // 检查会话
         val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
+
+        // 用于日志的工具名提取
+        val toolName = if (method == "tools/call") {
+            params?.get("name")?.jsonPrimitive?.contentOrNull ?: ""
+        } else ""
 
         // initialize 请求需要创建新会话
         if (method == "initialize") {
@@ -340,6 +565,21 @@ class McpServer(
             }
             resp.addHeader(SESSION_HEADER, newSessId)
             addCorsHeaders(resp)
+
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "initialize",
+                rpcId = id?.toString() ?: "",
+                sessionId = newSessId,
+                authResult = authResult,
+                requestBody = body,
+                responseBody = response.toString(),
+                success = true
+            )
             return resp
         }
 
@@ -347,6 +587,21 @@ class McpServer(
         if (sessionId.isNotEmpty() && !sessions.containsKey(sessionId)) {
             val resp = errorResponse(-32000, "Invalid session: $sessionId", id)
             resp.addHeader(SESSION_HEADER, sessionId)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = method ?: "",
+                rpcId = id?.toString() ?: "",
+                toolName = toolName,
+                sessionId = sessionId,
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Invalid session: $sessionId"
+            )
             return resp
         }
 
@@ -359,11 +614,46 @@ class McpServer(
                 "resources/list" -> listResources()
                 "resources/read" -> readResource(params)
                 "ping" -> buildJsonObject { put("pong", true) }
-                else -> return errorResponse(-32601, "Method not found: $method", id)
+                else -> {
+                    val resp = errorResponse(-32601, "Method not found: $method", id)
+                    logRecorder.log(
+                        httpMethod = "POST",
+                        httpPath = MCP_ENDPOINT,
+                        clientIp = clientIp,
+                        responseCode = 200,
+                        durationMs = System.currentTimeMillis() - requestStartTime,
+                        rpcMethod = method ?: "",
+                        rpcId = id?.toString() ?: "",
+                        toolName = toolName,
+                        sessionId = sessionId,
+                        authResult = authResult,
+                        requestBody = body,
+                        success = false,
+                        errorMessage = "Method not found: $method"
+                    )
+                    return resp
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "RPC error: ${e.message}", e)
-            return errorResponse(-32603, "Internal error: ${e.message}", id)
+            val resp = errorResponse(-32603, "Internal error: ${e.message}", id)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = method ?: "",
+                rpcId = id?.toString() ?: "",
+                toolName = toolName,
+                sessionId = sessionId,
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Internal error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
 
         // 通知（id 为 null 的请求）不需要返回结果
@@ -371,6 +661,18 @@ class McpServer(
             val resp = newFixedLengthResponse(Response.Status.OK, "application/json", "{}")
             addCorsHeaders(resp)
             if (sessionId.isNotEmpty()) resp.addHeader(SESSION_HEADER, sessionId)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = method ?: "",
+                sessionId = sessionId,
+                authResult = authResult,
+                requestBody = body,
+                success = true
+            )
             return resp
         }
 
@@ -389,16 +691,55 @@ class McpServer(
             resp.addHeader(SESSION_HEADER, sessionId)
         }
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "POST",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = method ?: "",
+            rpcId = id?.toString() ?: "",
+            toolName = toolName,
+            sessionId = sessionId,
+            authResult = authResult,
+            requestBody = body,
+            responseBody = response.toString(),
+            success = true
+        )
         return resp
     }
 
     /** 处理批量 JSON-RPC 请求 */
-    private fun handleBatchRpc(body: String, session: IHTTPSession, wantsSse: Boolean): Response {
+    private fun handleBatchRpc(
+        body: String,
+        session: IHTTPSession,
+        wantsSse: Boolean,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val requests = try {
             json.parseToJsonElement(body).jsonArray
         } catch (e: Exception) {
-            return errorResponse(-32700, "Parse error: ${e.message}", null)
+            val resp = errorResponse(-32700, "Parse error: ${e.message}", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "batch",
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Batch parse error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
+
+        val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
 
         val results = buildJsonArray {
             for (i in 0 until requests.size) {
@@ -442,6 +783,20 @@ class McpServer(
 
         val resp = jsonResponse(results.toString())
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "POST",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "batch",
+            sessionId = sessionId,
+            authResult = authResult,
+            requestBody = body,
+            responseBody = results.toString(),
+            success = true
+        )
         return resp
     }
 

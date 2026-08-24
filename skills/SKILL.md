@@ -1,6 +1,6 @@
 ---
 name: daytrace-timeline
-version: 2.0.0
+version: 0.3.1
 description: >
   Query phone activity and message data via DayTrace MCP server.
   Use when the user asks about their phone activity, timeline, app usage,

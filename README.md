@@ -287,19 +287,22 @@ adb install app\build\outputs\apk\release\app-release.apk
 ```
 app/src/main/java/com/daytrace/
 ├── DayTraceApp.kt               # Application
-├── MainActivity.kt              # Compose UI：首页/时间线/设置
+├── MainActivity.kt              # Compose UI：首页/时间线/MCP日志/设置
 ├── data/
 │   ├── MessageEntry.kt          # Room Entity
 │   ├── MessageDao.kt            # DAO
-│   └── MessageDatabase.kt       # Room (daytrace.db)
+│   ├── MessageDatabase.kt       # Room (daytrace.db + mcp_logs)
+│   ├── McpLogEntry.kt           # MCP 调用日志 Entity（17 字段）
+│   └── McpLogDao.kt             # MCP 日志 DAO（分页查询 + 统计）
 ├── service/
 │   ├── CaptureAccessibilityService.kt   # 三通道：快照+输入+切换
 │   └── NotificationCaptureService.kt    # 通知监听
 ├── export/
 │   └── TimelineExporter.kt      # 实时追加 MD + 完整导出
 ├── server/
-│   ├── McpServer.kt             # MCP Streamable HTTP 服务器（JSON-RPC + SSE + 会话管理）
+│   ├── McpServer.kt             # MCP Streamable HTTP 服务器（JSON-RPC + SSE + 会话管理 + 日志拦截）
 │   ├── McpServerService.kt       # MCP 前台服务 + Tunnel 生命周期
+│   ├── McpLogRecorder.kt         # MCP 日志异步写入器（协程非阻塞）
 │   └── CloudflareTunnelManager.kt  # cloudflared 进程管理 + DNS 代理 + 按需下载
 ├── net/
 │   ├── WebhookSender.kt         # Webhook 摘要推送
@@ -309,6 +312,8 @@ app/src/main/java/com/daytrace/
 │   └── BootReceiver.kt          # 开机自启动恢复定时上传
 ├── ui/
 │   ├── HistoryScreen.kt         # 时间线页面
+│   ├── McpLogScreen.kt          # MCP 调用日志审计页面（概览 + 过滤 + 分页 + 时序详情）
+│   ├── FilterModes.kt           # 过滤模式定义
 │   └── SettingsScreen.kt        # 设置页面
 └── util/
     ├── ShizukuHelper.kt         # Shizuku 一键授权
@@ -324,6 +329,50 @@ App 在设置页提供了「从最近任务隐藏」开关（默认关闭 = 显�
 - 前台通知仍保留（系统要求），但任务列表中不显示
 - 如需打开 App，从桌面图标启动即可
 
+## MCP 调用日志审计
+
+DayTrace 内置了完整的 MCP Server 调用审计系统，App 内「MCP日志」Tab 可查看每次 MCP 调用的完整记录。
+
+### 功能概览
+
+- **三层展示**：概览卡片 → 过滤栏 → 分页日志列表
+- **概览卡片**：总调用数 / 成功率 / 活跃会话数 / 最近调用时间
+- **自动刷新**：每 3 秒自动拉取最新日志和统计（无需手动刷新）
+- **过滤维度**：按 RPC 方法（initialize / tools/call / ping…）、成功/失败、工具名
+- **分页加载**：每次加载 50 条，滚动到底部自动加载更多
+- **调用时序详情**：点击任意条目展开，查看完整请求-响应时序（HTTP 方法、路径、客户端 IP、认证结果、请求体、响应体、耗时、错误堆栈）
+
+### 日志字段
+
+| 字段 | 说明 |
+|------|------|
+| timestamp | 调用时间戳 |
+| httpMethod / httpPath | HTTP 方法和路径 |
+| clientIp | 客户端真实 IP（穿透 Cloudflare 隧道） |
+| responseCode | HTTP 状态码 |
+| durationMs | 处理耗时（毫秒） |
+| rpcMethod | JSON-RPC 方法名 |
+| rpcId | JSON-RPC ID |
+| toolName | 工具名（tools/call 时） |
+| sessionId | MCP 会话 ID |
+| authResult | 认证结果（ok / failed / not_required） |
+| requestBody / responseBody | 请求/响应 JSON（截断 5000 字符） |
+| success | 是否成功 |
+| errorMessage / errorStack | 错误信息和堆栈 |
+
+### 真实客户端 IP 检测
+
+通过 Cloudflare 隧道访问时，MCP Server 会按以下优先级解析真实客户端 IP：
+
+1. `CF-Connecting-IP` header（Cloudflare 注入的真实 IP）
+2. `X-Forwarded-For` header（标准代理头，取第一个 IP）
+3. `remote-addr` header（直连时的 remote address）
+4. fallback `unknown`
+
+### 异步非阻塞写入
+
+日志通过 `McpLogRecorder` 在独立 `CoroutineScope`（`SupervisorJob`）中异步写入数据库，不影响 MCP 请求的响应延迟。
+
 ## 设计理念
 
 - **不打扰**：不逐条推送通知，不做高频全量扫描
@@ -332,13 +381,14 @@ App 在设置页提供了「从最近任务隐藏」开关（默认关闭 = 显�
 - **实时性**：每条记录实时写入 MD 文件，随时可取用
 - **可总结**：结构化 Markdown 表格，方便 AI 理解
 - **公网隧道**：内置 cloudflared 按需下载，一键暴露 MCP 到公网
+- **调用审计**：内置 MCP 日志系统，实时查看每次调用的完整时序
 - **后台隐藏**：不在最近任务中显示，防误杀
 - **隐私优先**：所有数据仅存本机
 
 ## 构建
 
 ```powershell
-cd E:\source\DayTrace
+cd E:\source\typevault
 
 # Debug 版
 .\gradlew.bat assembleDebug
@@ -356,7 +406,7 @@ cd E:\source\DayTrace
 - `minSdk = 29` (Android 10)
 - `targetSdk = 36` (Android 16)
 - `applicationId = com.daytrace`
-- `versionName = 0.3.0`
+- `versionName = 0.3.1`
 
 ## 已知局限
 
