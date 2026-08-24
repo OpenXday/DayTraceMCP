@@ -159,6 +159,7 @@ DayTrace MCP Server 实现了 **MCP Streamable HTTP 传输规范**（协议版�
 | `DELETE` | `/mcp` | 终止会话 |
 | `GET` | `/` | 健康检查 |
 | `GET` | `/mcp/tools` | 工具列表（便利端点） |
+| `GET` | `/captures/<category>/<filename>` | 下载拍摄的照片/视频/音频文件 |
 
 ### 会话管理
 
@@ -190,6 +191,12 @@ DayTrace MCP Server 实现了 **MCP Streamable HTTP 传输规范**（协议版�
 | `get_conversation` | 获取指定应用和联系人的完整对话上下文 |
 | `list_conversations` | 列出所有对话（应用 + 联系人/群组） |
 | `clear_all_messages` | 清空所有记录（谨慎使用） |
+| `take_photo` | 远程拍照（指定前后置/分辨率/闪光灯，返回 Base64 JPEG + 拍摄参数） |
+| `record_video` | 远程录像（默认 6s 720p MP4，可指定时长/分辨率） |
+| `record_audio` | 远程录音（默认 10s AAC/M4A，可指定时长/格式） |
+| `list_captures` | 列出所有已拍摄的照片/视频/音频文件 |
+| `delete_capture` | 删除指定拍摄文件 |
+| `grant_camera_mic_permissions` | 通过 Shizuku 自动授予相机/麦克风权限 |
 
 ### 客户端配置
 
@@ -245,6 +252,34 @@ curl -X POST http://<手机IP>:9876/mcp \
 curl -X POST http://<手机IP>:9876/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_messages","arguments":{"keyword":"飞书"}}}'
+
+# 远程拍照（后置摄像头，1080p）
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"take_photo","arguments":{"camera":"back","resolution":"1080p"}}}'
+
+# 远程拍照（前置摄像头，720p，开闪光灯）
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"take_photo","arguments":{"camera":"front","resolution":"720p","flash":"on"}}}'
+
+# 录像（后置，6秒，720p）
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"record_video","arguments":{"camera":"back","duration":6,"resolution":"720p"}}}'
+
+# 录音（10秒，AAC格式）
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"record_audio","arguments":{"duration":10,"format":"aac"}}}'
+
+# 下载拍摄的照片
+curl -o photo.jpg http://<手机IP>:9876/captures/photos/photo_2026-08-24_14-30-00-000.jpg
+
+# 通过 Shizuku 授予相机/麦克风权限
+curl -X POST http://<手机IP>:9876/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"grant_camera_mic_permissions","arguments":{}}}'
 ```
 
 ## 安装
@@ -303,6 +338,8 @@ app/src/main/java/com/daytrace/
 │   ├── McpServer.kt             # MCP Streamable HTTP 服务器（JSON-RPC + SSE + 会话管理 + 日志拦截）
 │   ├── McpServerService.kt       # MCP 前台服务 + Tunnel 生命周期
 │   ├── McpLogRecorder.kt         # MCP 日志异步写入器（协程非阻塞）
+│   ├── CameraCaptureManager.kt  # Camera2 拍照/录像管理器（远程拍照/录像）
+│   ├── AudioCaptureManager.kt   # 录音管理器（AAC/WAV 录音）
 │   └── CloudflareTunnelManager.kt  # cloudflared 进程管理 + DNS 代理 + 按需下载
 ├── net/
 │   ├── WebhookSender.kt         # Webhook 摘要推送

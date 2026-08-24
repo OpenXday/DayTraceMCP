@@ -166,6 +166,8 @@ fun HomeScreen() {
     var notifEnabled by remember { mutableStateOf(false) }
     var shizukuRunning by remember { mutableStateOf(false) }
     var shizukuAuthed by remember { mutableStateOf(false) }
+    var cameraGranted by remember { mutableStateOf(false) }
+    var micGranted by remember { mutableStateOf(false) }
     var captureEnabled by remember { mutableStateOf(Prefs.isCaptureEnabled(context)) }
     var grantInProgress by remember { mutableStateOf(false) }
 
@@ -174,6 +176,8 @@ fun HomeScreen() {
         notifEnabled = ShizukuHelper.isNotificationListenerEnabled(context)
         shizukuRunning = ShizukuHelper.isShizukuRunning()
         shizukuAuthed = ShizukuHelper.hasPermission()
+        cameraGranted = ShizukuHelper.isCameraGranted(context)
+        micGranted = ShizukuHelper.isMicGranted(context)
     }
 
     // === Auto refresh ===
@@ -188,7 +192,7 @@ fun HomeScreen() {
                 delay(500)
                 refreshStatus()
                 elapsed += 500
-                if (a11yEnabled && notifEnabled) {
+                if (a11yEnabled && notifEnabled && cameraGranted && micGranted) {
                     grantInProgress = false
                     Toast.makeText(context, "权限已生效", Toast.LENGTH_SHORT).show()
                     break
@@ -235,6 +239,9 @@ fun HomeScreen() {
                     StatusRow("Shizuku 运行中", shizukuRunning)
                     StatusRow("Shizuku 已授权", shizukuAuthed)
                     HorizontalDivider(color = Color(0xFF333344))
+                    StatusRow("相机权限（远程拍照/录像）", cameraGranted)
+                    StatusRow("麦克风权限（远程录像/录音）", micGranted)
+                    HorizontalDivider(color = Color(0xFF333344))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("采集开关", modifier = Modifier.weight(1f))
                         Switch(
@@ -276,7 +283,9 @@ fun HomeScreen() {
                                 scope.launch {
                                     val r1 = ShizukuHelper.enableAccessibilityService(context, CaptureAccessibilityService::class.java)
                                     val r2 = ShizukuHelper.enableNotificationListener(context, NotificationCaptureService::class.java)
-                                    if (r1.isSuccess && r2.isSuccess) {
+                                    // 同时授予相机和录音权限
+                                    val r3 = ShizukuHelper.grantCameraAndMicPermissions(context)
+                                    if (r1.isSuccess && r2.isSuccess && r3.isSuccess) {
                                         Toast.makeText(context, "授权成功，正在刷新...", Toast.LENGTH_SHORT).show()
                                     } else if (r1.isFailure && r1.exceptionOrNull() is ShizukuHelper.AccessibilityAutoEnableException) {
                                         // 无障碍自动开启失败，引导用户手动开启
@@ -286,7 +295,7 @@ fun HomeScreen() {
                                         kotlinx.coroutines.delay(1500)
                                         context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                                     } else {
-                                        val err = r1.exceptionOrNull()?.message ?: r2.exceptionOrNull()?.message ?: "未知错误"
+                                        val err = r1.exceptionOrNull()?.message ?: r2.exceptionOrNull()?.message ?: r3.exceptionOrNull()?.message ?: "未知错误"
                                         Toast.makeText(context, "失败: $err", Toast.LENGTH_LONG).show()
                                         grantInProgress = false
                                     }

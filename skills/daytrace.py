@@ -22,6 +22,13 @@ DayTrace MCP 命令行助手 —— 配合 daytrace-mcp SKILL 使用。
   python daytrace.py progress [date]              # 上传进度
   python daytrace.py skills                       # 上传 Skill 列表
   python daytrace.py tools                        # 工具清单
+  # 远程拍照/录像/录音
+  python daytrace.py grant                        # 通过 Shizuku 授予相机/麦克风权限
+  python daytrace.py photo [camera] [resolution] [flash]  # 拍照
+  python daytrace.py video [camera] [duration] [resolution]  # 录像
+  python daytrace.py audio [duration] [format]     # 录音
+  python daytrace.py captures                     # 列出所有拍摄文件
+  python daytrace.py delete <filename> [category]  # 删除拍摄文件
 
 环境变量(必填): DAYTRACE_URL / DAYTRACE_TOKEN 用于连接 DayTrace MCP 端点。
 """
@@ -288,6 +295,78 @@ def cmd_tools(_args):
     print(text_of(call_tool("tools/list", {}, rid=0)))
 
 
+# ---------------- 远程拍照/录像/录音 ----------------
+
+def cmd_grant(_args):
+    """通过 Shizuku 授予相机和麦克风权限。"""
+    print(text_of(call_tool("grant_camera_mic_permissions")))
+
+
+def cmd_photo(args):
+    """拍照: photo [camera] [resolution] [flash]
+    camera: back (默认) / front
+    resolution: 1080p (默认) / 720p / 4k / max / WxH
+    flash: off (默认) / on / auto
+    """
+    camera = args[0] if args else "back"
+    resolution = args[1] if len(args) > 1 else "1080p"
+    flash = args[2] if len(args) > 2 else "off"
+    print(text_of(call_tool("take_photo", {
+        "camera": camera,
+        "resolution": resolution,
+        "flash": flash,
+    })))
+
+
+def cmd_video(args):
+    """录像: video [camera] [duration] [resolution]
+    camera: back (默认) / front
+    duration: 6 (默认, 1-60秒)
+    resolution: 720p (默认) / 1080p / 480p
+    """
+    camera = args[0] if args else "back"
+    duration = int(args[1]) if len(args) > 1 and args[1].isdigit() else 6
+    resolution = args[2] if len(args) > 2 else "720p"
+    print(text_of(call_tool("record_video", {
+        "camera": camera,
+        "duration": duration,
+        "resolution": resolution,
+    })))
+
+
+def cmd_audio(args):
+    """录音: audio [duration] [format]
+    duration: 10 (默认, 1-300秒)
+    format: aac (默认, M4A) / wav
+    """
+    duration = int(args[0]) if args and args[0].isdigit() else 10
+    fmt = args[1] if len(args) > 1 else "aac"
+    print(text_of(call_tool("record_audio", {
+        "duration": duration,
+        "format": fmt,
+    })))
+
+
+def cmd_captures(_args):
+    """列出所有拍摄文件。"""
+    print(text_of(call_tool("list_captures")))
+
+
+def cmd_delete(args):
+    """删除拍摄文件: delete <filename> [category]
+    category: photos (默认) / videos / audio
+    """
+    if not args:
+        print("用法: delete <filename> [category]", file=sys.stderr)
+        sys.exit(1)
+    filename = args[0]
+    category = args[1] if len(args) > 1 else "photos"
+    print(text_of(call_tool("delete_capture", {
+        "filename": filename,
+        "category": category,
+    })))
+
+
 COMMANDS = {
     "call": cmd_call,
     "timeline": cmd_timeline,
@@ -302,6 +381,13 @@ COMMANDS = {
     "progress": cmd_progress,
     "skills": cmd_skills,
     "tools": cmd_tools,
+    # 远程拍照/录像/录音
+    "grant": cmd_grant,
+    "photo": cmd_photo,
+    "video": cmd_video,
+    "audio": cmd_audio,
+    "captures": cmd_captures,
+    "delete": cmd_delete,
 }
 
 

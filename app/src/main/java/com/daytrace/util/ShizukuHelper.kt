@@ -283,4 +283,73 @@ object ShizukuHelper {
         ) ?: return false
         return enabled.contains(flat)
     }
+
+    // === 运行时权限（相机/录音）===
+
+    /**
+     * 通过 Shizuku shell 授予运行时权限（dangerous permissions）
+     *
+     * 使用 `pm grant <package> <permission>` 命令，以 shell 身份执行。
+     * shell 用户有权限直接授予 dangerous permissions，无需用户弹窗确认。
+     *
+     * @param context Context
+     * @param permissions 要授予的权限列表（如 android.permission.CAMERA）
+     * @return Result<Unit> 成功或失败
+     */
+    fun grantRuntimePermissions(context: Context, permissions: List<String>): Result<Unit> {
+        if (!hasPermission()) {
+            return Result.failure(IllegalStateException("Shizuku permission not granted"))
+        }
+
+        val pkg = context.packageName
+        var allSuccess = true
+        val failedPerms = mutableListOf<String>()
+
+        for (perm in permissions) {
+            // 先检查是否已授权
+            val granted = context.checkSelfPermission(perm) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                Log.d(TAG, "grantRuntimePermissions: $perm already granted")
+                continue
+            }
+
+            val cmd = "pm grant $pkg $perm"
+            Log.i(TAG, "grantRuntimePermissions: $cmd")
+            val result = execShell(cmd)
+            if (result.isFailure) {
+                Log.e(TAG, "grantRuntimePermissions: failed for $perm: ${result.exceptionOrNull()?.message}")
+                allSuccess = false
+                failedPerms.add(perm)
+            } else {
+                Log.i(TAG, "grantRuntimePermissions: $perm granted successfully")
+            }
+        }
+
+        return if (allSuccess) {
+            Result.success(Unit)
+        } else {
+            Result.failure(RuntimeException("Failed to grant: ${failedPerms.joinToString(", ")}"))
+        }
+    }
+
+    /** 授予相机和录音权限 */
+    fun grantCameraAndMicPermissions(context: Context): Result<Unit> {
+        return grantRuntimePermissions(context, listOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO
+        ))
+    }
+
+    /** 检查相机权限是否已授予 */
+    fun isCameraGranted(context: Context): Boolean {
+        return context.checkSelfPermission(android.Manifest.permission.CAMERA) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    /** 检查录音权限是否已授予 */
+    fun isMicGranted(context: Context): Boolean {
+        return context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
 }

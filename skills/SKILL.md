@@ -5,8 +5,11 @@ description: >
   Query phone activity and message data via DayTrace MCP server.
   Use when the user asks about their phone activity, timeline, app usage,
   messages in specific apps, conversation history, or message statistics.
-  Triggers: 今天做了什么, 时间线, 聊天记录, 手机使用记录, 在XX里聊了什么,
-  消息统计, 用了什么app, conversation history, phone activity, timeline.
+  Also supports remote camera capture (photo/video) and audio recording.
+  Triggers: what did I do today, timeline, chat history, phone usage,
+  what was discussed in XX, message stats, which apps were used,
+  take a photo, record video, record audio, front/back camera,
+  conversation history, phone activity, timeline.
 ---
 
 # DayTrace Timeline
@@ -51,6 +54,25 @@ It changes on each restart.
 |------|-------------|---------|
 | `clear_all_messages` | Delete ALL captured messages | **Irreversible! Use with caution.** |
 
+### Remote Camera & Microphone
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `take_photo` | Remote capture a photo. Returns base64 JPEG + capture parameters (ISO, exposure, aperture, etc.) | `camera` (back/front), `resolution` (720p/1080p/4k/max/WxH), `flash` (off/on/auto) |
+| `record_video` | Record a short video (default 6s 720p MP4 with audio). Returns download URL or base64. | `camera` (back/front), `duration` (1-60s), `resolution` (720p/1080p/480p), `returnBase64` (bool) |
+| `record_audio` | Record audio from microphone (default 10s AAC/M4A). Returns base64 audio. | `duration` (1-300s), `format` (aac/wav) |
+| `list_captures` | List all captured photos, videos, and audio files on device | none |
+| `delete_capture` | Delete a captured file by filename | `filename` (required), `category` (photos/videos/audio) |
+| `grant_camera_mic_permissions` | Grant CAMERA and RECORD_AUDIO via Shizuku (shell pm grant) | none |
+
+**Permissions**: Camera/mic permissions must be granted before using capture tools.
+Call `grant_camera_mic_permissions` first (requires Shizuku running), or grant manually in Android Settings.
+
+**File download**: Captured files can be downloaded via HTTP:
+- Photos: `GET /captures/photos/<filename>`
+- Videos: `GET /captures/videos/<filename>`
+- Audio: `GET /captures/audio/<filename>`
+
 ## App Package Names
 
 Common IM app package names for use with `appPackage` parameter:
@@ -72,6 +94,51 @@ Common IM app package names for use with `appPackage` parameter:
 
 ## Common Patterns
 
+### Remote capture a photo (back camera, 1080p)
+
+```
+tools/call take_photo {"camera":"back","resolution":"1080p"}
+```
+
+Returns base64 JPEG data + capture parameters (ISO, focal length, aperture, exposure time, white balance).
+Use `camera: "front"` for front-facing camera. Flash: `off` (default) / `on` / `auto`.
+
+### Record a short video (6s, 720p)
+
+```
+tools/call record_video {"camera":"back","duration":6,"resolution":"720p"}
+```
+
+Returns a download URL by default. Set `returnBase64: true` to get inline base64 video data.
+Duration: 1-60 seconds. Resolution: 720p (default) / 1080p / 480p.
+
+### Record audio (10s, AAC)
+
+```
+tools/call record_audio {"duration":10,"format":"aac"}
+```
+
+Returns base64-encoded audio data. Duration: 1-300 seconds. Format: `aac` (M4A, default) / `wav`.
+
+### Grant camera/mic permissions via Shizuku
+
+```
+tools/call grant_camera_mic_permissions {}
+```
+
+Requires Shizuku running and authorized. Call this before first use of capture tools.
+
+### Download a captured file
+
+Files are downloadable via HTTP GET:
+```
+GET /captures/photos/<filename>
+GET /captures/videos/<filename>
+GET /captures/audio/<filename>
+```
+
+Use `list_captures` to list all files with their filenames.
+
 ### Get today's timeline (most common)
 
 ```
@@ -87,7 +154,7 @@ chronological view of phone activity.
 ### Search messages by keyword
 
 ```
-tools/call search_messages {"keyword":"产品需求","limit":50}
+tools/call search_messages {"keyword":"product requirements","limit":50}
 ```
 
 ### Get conversation for a specific app
@@ -122,3 +189,8 @@ Returns total count, outgoing/incoming breakdown, and per-app counts.
 - **Large results**: output may be truncated; reduce `limit` or narrow the time range
 - **Data is local**: all data is stored on the phone; no cloud sync
 - **Direction**: `outgoing` = sent by you (captured via accessibility), `incoming` = received (captured via notifications)
+- **Camera/Mic permissions**: Must be granted before using `take_photo`/`record_video`/`record_audio`. Call `grant_camera_mic_permissions` first (requires Shizuku), or grant manually in Android Settings. The app's one-click grant button also grants these.
+- **Photo resolution**: `720p` / `1080p` (default) / `4k` / `max` / custom `WxH` (e.g. `1920x1080`). The tool picks the closest supported size.
+- **Video resolution**: `720p` (default) / `1080p` / `480p`. The tool picks the closest supported size ≤ target.
+- **Base64 data**: Photo and audio results include base64-encoded file data inline. Video returns a download URL by default; set `returnBase64: true` for inline data (may be large).
+- **Capture files location**: Files are stored in `Android/data/com.daytrace/files/captures/{photos,videos,audio}/` on the device.

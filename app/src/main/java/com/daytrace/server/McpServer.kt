@@ -20,6 +20,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.add
+import android.util.Base64
+import java.io.File
+import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -71,6 +74,16 @@ class McpServer(
     /** MCP 调用日志记录器（异步写入数据库，不阻塞请求处理） */
     private val logRecorder by lazy {
         McpLogRecorder(context)
+    }
+
+    /** 相机拍照/录像管理器 */
+    private val cameraManager by lazy {
+        CameraCaptureManager(context.applicationContext)
+    }
+
+    /** 录音管理器 */
+    private val audioManager by lazy {
+        AudioCaptureManager(context.applicationContext)
     }
 
     fun startServer() {
@@ -214,6 +227,11 @@ private fun getClientIp(session: IHTTPSession): String {
         // MCP Streamable HTTP transport endpoint
         if (uri == MCP_ENDPOINT) {
             return handleMcpEndpoint(session, method, clientIp, authResult, requestStartTime)
+        }
+
+        // 文件下载端点：/captures/photos/<filename>, /captures/videos/<filename>, /captures/audio/<filename>
+        if (uri.startsWith("/captures/") && method == Method.GET) {
+            return handleCaptureDownload(uri, clientIp, authResult, requestStartTime)
         }
 
         // OpenAPI-style discovery (convenience endpoint)
@@ -935,6 +953,50 @@ private fun getClientIp(session: IHTTPSession): String {
                 name = "clear_all_messages",
                 description = "Delete all captured messages. Use with caution!"
             ))
+            add(toolJson(
+                name = "take_photo",
+                description = "Remote capture a photo from the phone camera. Returns base64-encoded JPEG image data and capture parameters.",
+                properties = buildJsonObject {
+                    put("camera", propObj("string", "Camera to use: 'back' (default) or 'front'", "back"))
+                    put("resolution", propObj("string", "Photo resolution: '720p', '1080p' (default), '4k', 'max', or custom 'WxH' (e.g. '1920x1080')", "1080p"))
+                    put("flash", propObj("string", "Flash mode: 'off' (default), 'on', or 'auto'", "off"))
+                }
+            ))
+            add(toolJson(
+                name = "record_video",
+                description = "Record a short video from the phone camera. Default: 6s 720p MP4 with audio. Returns a download URL or base64-encoded video data.",
+                properties = buildJsonObject {
+                    put("camera", propObj("string", "Camera to use: 'back' (default) or 'front'", "back"))
+                    put("duration", propObj("integer", "Duration in seconds (default 6, max 60)", 6))
+                    put("resolution", propObj("string", "Video resolution: '720p' (default), '1080p', '480p'", "720p"))
+                    put("returnBase64", propObj("boolean", "If true, return video as base64 data (default false, returns download URL)", false))
+                }
+            ))
+            add(toolJson(
+                name = "record_audio",
+                description = "Record audio from the phone microphone. Default: 10s AAC/M4A format. Returns base64-encoded audio data.",
+                properties = buildJsonObject {
+                    put("duration", propObj("integer", "Duration in seconds (default 10, max 300)", 10))
+                    put("format", propObj("string", "Audio format: 'aac' (default, M4A container) or 'wav'", "aac"))
+                }
+            ))
+            add(toolJson(
+                name = "list_captures",
+                description = "List all captured photos, videos, and audio files stored on the device."
+            ))
+            add(toolJson(
+                name = "delete_capture",
+                description = "Delete a captured file by its filename.",
+                properties = buildJsonObject {
+                    put("filename", propObj("string", "Filename to delete (e.g. photo_2026-08-24_14-30-00-000.jpg)", ""))
+                    put("category", propObj("string", "Category: 'photos', 'videos', or 'audio'", "photos"))
+                },
+                required = listOf("filename")
+            ))
+            add(toolJson(
+                name = "grant_camera_mic_permissions",
+                description = "Attempt to grant CAMERA and RECORD_AUDIO permissions via Shizuku (shell-level pm grant). Requires Shizuku running and authorized."
+            ))
         }
 
         return buildJsonObject {
@@ -1205,8 +1267,185 @@ private fun getClientIp(session: IHTTPSession): String {
                 "All messages have been deleted."
             }
 
+            "take_photo" -> {
+                val camera = args["camera"]?.jsonPrimitive?.contentOrNull ?: "back"
+                val resolution = args["resolution"]?.jsonPrimitive?.contentOrNull ?: "1080p"
+                val flash = args["flash"]?.jsonPrimitive?.contentOrNull ?: "off"
+
+                // 检查权限
+                val hasPerm = context.checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!hasPerm) {
+                    "Error: CAMERA permission not granted. Call grant_camera_mic_permissions first."
+                } else {
+                    val result = cameraManager.takePhoto(camera, resolution, flash)
+                    if (result != null) {
+                        val base64 = encodeFileBase64(result.file)
+                        buildString {
+                            appendLine("=== Photo Captured ===")
+                            appendLine("Camera: ${result.cameraFacing}")
+                            appendLine("Resolution: ${result.width}x${result.height}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Flash: ${result.flashMode}")
+                            // 拍摄参数
+                            result.focalLength?.let { appendLine("Focal length: ${it}mm") }
+                            result.iso?.let { appendLine("ISO: $it") }
+                            result.exposureTimeNs?.let {
+                                val exposureMs = it / 1_000_000.0
+                                appendLine("Exposure time: ${exposureMs}ms (${it}ns)")
+                            }
+                            result.aperture?.let { appendLine("Aperture: f/$it") }
+                            result.whiteBalanceMode?.let { appendLine("White balance: $it") }
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/photos/${result.file.name}")
+                            if (base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(base64 encoding failed, use download URL)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to capture photo. Check camera permissions and availability."
+                    }
+                }
+            }
+
+            "record_video" -> {
+                val camera = args["camera"]?.jsonPrimitive?.contentOrNull ?: "back"
+                val duration = args["duration"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 60) ?: 6
+                val resolution = args["resolution"]?.jsonPrimitive?.contentOrNull ?: "720p"
+                val returnBase64 = args["returnBase64"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+
+                // 检查权限
+                val hasCamera = context.checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                val hasMic = context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!hasCamera || !hasMic) {
+                    "Error: CAMERA and RECORD_AUDIO permissions required. Call grant_camera_mic_permissions first."
+                } else {
+                    val result = cameraManager.recordVideo(camera, duration, resolution)
+                    if (result != null) {
+                        val base64 = if (returnBase64) encodeFileBase64(result.file) else null
+                        buildString {
+                            appendLine("=== Video Recorded ===")
+                            appendLine("Camera: ${result.cameraFacing}")
+                            appendLine("Resolution: ${result.width}x${result.height}")
+                            appendLine("Duration: ${result.durationSec}s")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/videos/${result.file.name}")
+                            if (returnBase64 && base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(Use download URL or set returnBase64=true for inline data)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to record video. Check camera/mic permissions and availability."
+                    }
+                }
+            }
+
+            "record_audio" -> {
+                val duration = args["duration"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 300) ?: 10
+                val format = args["format"]?.jsonPrimitive?.contentOrNull ?: "aac"
+
+                // 检查权限
+                val hasMic = context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!hasMic) {
+                    "Error: RECORD_AUDIO permission not granted. Call grant_camera_mic_permissions first."
+                } else {
+                    val result = audioManager.recordAudio(duration, format)
+                    if (result != null) {
+                        val base64 = encodeFileBase64(result.file)
+                        buildString {
+                            appendLine("=== Audio Recorded ===")
+                            appendLine("Format: ${result.mimeType}")
+                            appendLine("Duration: ${result.durationSec}s")
+                            appendLine("Sample rate: ${result.sampleRate} Hz")
+                            appendLine("Channels: ${result.channels}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/audio/${result.file.name}")
+                            if (base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(base64 encoding failed, use download URL)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to record audio. Check microphone permissions."
+                    }
+                }
+            }
+
+            "list_captures" -> {
+                val capturesDir = context.getExternalFilesDir("captures")!!
+                buildString {
+                    appendLine("=== Captured Files ===")
+                    for (category in listOf("photos", "videos", "audio")) {
+                        val dir = File(capturesDir, category)
+                        val files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
+                        appendLine()
+                        appendLine("[$category] (${files.size} files)")
+                        if (files.isEmpty()) {
+                            appendLine("  (none)")
+                        } else {
+                            for (f in files) {
+                                val date = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date(f.lastModified()))
+                                appendLine("  ${f.name} (${f.length()} bytes, $date)")
+                            }
+                        }
+                    }
+                }
+            }
+
+            "delete_capture" -> {
+                val filename = args["filename"]?.jsonPrimitive?.contentOrNull ?: ""
+                val category = args["category"]?.jsonPrimitive?.contentOrNull ?: "photos"
+                if (filename.isBlank()) {
+                    "Error: filename is required"
+                } else {
+                    // 安全检查：防止路径遍历
+                    val safeName = File(filename).name
+                    val capturesDir = context.getExternalFilesDir("captures")!!
+                    val file = File(File(capturesDir, category), safeName)
+                    if (file.exists() && file.delete()) {
+                        "Deleted: ${file.name}"
+                    } else {
+                        "File not found or delete failed: $safeName"
+                    }
+                }
+            }
+
+            "grant_camera_mic_permissions" -> {
+                val result = com.daytrace.util.ShizukuHelper.grantCameraAndMicPermissions(context)
+                if (result.isSuccess) {
+                    val cameraGranted = com.daytrace.util.ShizukuHelper.isCameraGranted(context)
+                    val micGranted = com.daytrace.util.ShizukuHelper.isMicGranted(context)
+                    buildString {
+                        appendLine("=== Permission Grant Result ===")
+                        appendLine("Camera: ${if (cameraGranted) "granted" else "NOT granted"}")
+                        appendLine("Microphone: ${if (micGranted) "granted" else "NOT granted"}")
+                        if (!cameraGranted || !micGranted) {
+                            appendLine("Some permissions failed. Please grant manually in Android Settings.")
+                        }
+                    }
+                } else {
+                    "Error: ${result.exceptionOrNull()?.message}"
+                }
+            }
+
             else -> "Unknown tool: $name"
-        }
+            }
 
         return buildJsonObject {
             put("content", buildJsonArray {
@@ -1279,6 +1518,116 @@ private fun getClientIp(session: IHTTPSession): String {
                     put("text", JsonPrimitive(content))
                 })
             })
+        }
+    }
+
+    // === 文件下载端点 ===
+
+    /**
+     * 处理 /captures/<category>/<filename> GET 请求
+     *
+     * 支持的路径：
+     *   /captures/photos/<filename>   — 下载照片
+     *   /captures/videos/<filename>    — 下载视频
+     *   /captures/audio/<filename>     — 下载音频
+     */
+    private fun handleCaptureDownload(
+        uri: String,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
+        // 解析路径：/captures/<category>/<filename>
+        val parts = uri.removePrefix("/captures/").split("/", limit = 2)
+        if (parts.size != 2) {
+            val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Invalid path: $uri")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 404, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "Invalid path"
+            )
+            return resp
+        }
+
+        val category = parts[0]
+        val filename = File(parts[1]).name  // 防止路径遍历
+
+        // 验证 category
+        if (category !in listOf("photos", "videos", "audio")) {
+            val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Invalid category: $category")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 404, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "Invalid category: $category"
+            )
+            return resp
+        }
+
+        val capturesDir = context.getExternalFilesDir("captures")!!
+        val file = File(File(capturesDir, category), filename)
+
+        if (!file.exists() || !file.isFile) {
+            val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "File not found: $filename")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 404, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "File not found: $filename"
+            )
+            return resp
+        }
+
+        // 确定 MIME type
+        val mimeType = when {
+            filename.endsWith(".jpg", true) || filename.endsWith(".jpeg", true) -> "image/jpeg"
+            filename.endsWith(".png", true) -> "image/png"
+            filename.endsWith(".mp4", true) -> "video/mp4"
+            filename.endsWith(".m4a", true) || filename.endsWith(".aac", true) -> "audio/mp4"
+            filename.endsWith(".wav", true) -> "audio/wav"
+            else -> "application/octet-stream"
+        }
+
+        try {
+            val fis = FileInputStream(file)
+            val resp = newFixedLengthResponse(Response.Status.OK, mimeType, fis, file.length())
+            resp.addHeader("Content-Disposition", "attachment; filename=\"$filename\"")
+            resp.addHeader("Content-Length", file.length().toString())
+            addCorsHeaders(resp)
+
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 200, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                responseBody = "file: $filename (${file.length()} bytes)",
+                success = true
+            )
+            return resp
+        } catch (e: Exception) {
+            val resp = newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Read error: ${e.message}")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 500, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "Read error: ${e.message}"
+            )
+            return resp
+        }
+    }
+
+    /** 将文件编码为 Base64 字符串（用于内嵌返回照片/音频） */
+    private fun encodeFileBase64(file: File): String? {
+        return try {
+            val bytes = file.readBytes()
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            Log.e(TAG, "encodeFileBase64 failed: ${e.message}")
+            null
         }
     }
 

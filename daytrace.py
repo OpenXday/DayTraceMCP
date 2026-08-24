@@ -22,8 +22,15 @@ DayTrace MCP 命令行助手 —— 配合 daytrace-mcp SKILL 使用。
   python daytrace.py progress [date]              # 上传进度
   python daytrace.py skills                       # 上传 Skill 列表
   python daytrace.py tools                        # 工具清单
+  # 远程拍照/录像/录音
+  python daytrace.py grant                        # 通过 Shizuku 授予相机/麦克风权限
+  python daytrace.py photo [camera] [resolution] [flash]  # 拍照
+  python daytrace.py video [camera] [duration] [resolution]  # 录像
+  python daytrace.py audio [duration] [format]     # 录音
+  python daytrace.py captures                     # 列出所有拍摄文件
+  python daytrace.py delete <filename> [category]  # 删除拍摄文件
 
-环境变量: DAYTRACE_URL / DAYTRACE_TOKEN 可覆盖默认值。
+环境变量(必填): DAYTRACE_URL / DAYTRACE_TOKEN 用于连接 DayTrace MCP 端点。
 """
 import sys
 import json
@@ -33,9 +40,22 @@ import urllib.request
 import urllib.error
 import os
 
-# 默认连接信息(可从环境变量覆盖)
-MCP_URL = os.environ.get("DAYTRACE_URL", "https://changes-nested-procedures-solved.trycloudflare.com/mcp")
-MCP_TOKEN = os.environ.get("DAYTRACE_TOKEN", "xueminghui")
+# 连接信息: 仅从环境变量读取, 不内置任何默认值, 避免泄露端点与凭据
+MCP_URL = os.environ.get("DAYTRACE_URL", "")
+MCP_TOKEN = os.environ.get("DAYTRACE_TOKEN", "")
+
+
+def check_env():
+    """校验必需的环境变量, 缺失时给出清晰提示。"""
+    missing = [name for name, val in
+               (("DAYTRACE_URL", MCP_URL), ("DAYTRACE_TOKEN", MCP_TOKEN))
+               if not val]
+    if missing:
+        print("缺少环境变量: " + ", ".join(missing), file=sys.stderr)
+        print("示例:", file=sys.stderr)
+        print("  DAYTRACE_URL=https://<mcp-endpoint>/mcp DAYTRACE_TOKEN=<token>"
+              " python daytrace.py stats", file=sys.stderr)
+        sys.exit(1)
 
 
 def reconfigure_stdout():
@@ -63,12 +83,22 @@ def call_tool(name, arguments=None, rid=1):
     })
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            print("服务器返回了非 JSON 内容(可能隧道异常或 HTML 错误页):\n"
+                  + raw[:800], file=sys.stderr)
+            sys.exit(1)
     except urllib.error.HTTPError as e:
-        print("HTTP 错误:", e.code, e.read().decode("utf-8", "replace"), file=sys.stderr)
+        body = e.read().decode("utf-8", "replace")
+        print("HTTP 错误:", e.code, body[:800], file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
         print("连接失败(检查 URL/网络):", e.reason, file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print("请求超时(60s), 服务器可能繁忙或隧道异常", file=sys.stderr)
         sys.exit(1)
 
 
@@ -84,7 +114,7 @@ def text_of(result):
 def parse_conversations(raw):
     """解析 list_conversations 的文本输出为 [(label, app, count), ...]。
 
-    行格式: `微信 · 大胡宝贝 (com.tencent.mm): 18 messages`
+    行格式: `微信 · 联系人甲 (com.tencent.mm): 18 messages`
     或纯 App: `tv.danmaku.bili (tv.danmaku.bili): 3050 messages`
     """
     entries = []
@@ -99,7 +129,7 @@ def parse_conversations(raw):
 
 
 def contact_part(label):
-    """从 `微信 · 大胡宝贝` 中取出联系人部分(最后一段 ` · ` 之后)。"""
+    """从 `微信 · 联系人甲` 中取出联系人部分(最后一段 ` · ` 之后)。"""
     if " · " in label:
         return label.split(" · ")[-1].strip()
     return label.strip()
@@ -217,7 +247,7 @@ def cmd_recent(args):
 
 
 def to_ms(value):
-    """ISO 时间(2026-08-24 或 2026-08-24 15:00:00)或毫秒时间戳 -> 毫秒。"""
+    """ISO 时间(YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS)或毫秒时间戳 -> 毫秒。"""
     v = str(value).strip()
     if v.isdigit():
         return int(v)
@@ -265,6 +295,78 @@ def cmd_tools(_args):
     print(text_of(call_tool("tools/list", {}, rid=0)))
 
 
+# ---------------- 远程拍照/录像/录音 ----------------
+
+def cmd_grant(_args):
+    """通过 Shizuku 授予相机和麦克风权限。"""
+    print(text_of(call_tool("grant_camera_mic_permissions")))
+
+
+def cmd_photo(args):
+    """拍照: photo [camera] [resolution] [flash]
+    camera: back (默认) / front
+    resolution: 1080p (默认) / 720p / 4k / max / WxH
+    flash: off (默认) / on / auto
+    """
+    camera = args[0] if args else "back"
+    resolution = args[1] if len(args) > 1 else "1080p"
+    flash = args[2] if len(args) > 2 else "off"
+    print(text_of(call_tool("take_photo", {
+        "camera": camera,
+        "resolution": resolution,
+        "flash": flash,
+    })))
+
+
+def cmd_video(args):
+    """录像: video [camera] [duration] [resolution]
+    camera: back (默认) / front
+    duration: 6 (默认, 1-60秒)
+    resolution: 720p (默认) / 1080p / 480p
+    """
+    camera = args[0] if args else "back"
+    duration = int(args[1]) if len(args) > 1 and args[1].isdigit() else 6
+    resolution = args[2] if len(args) > 2 else "720p"
+    print(text_of(call_tool("record_video", {
+        "camera": camera,
+        "duration": duration,
+        "resolution": resolution,
+    })))
+
+
+def cmd_audio(args):
+    """录音: audio [duration] [format]
+    duration: 10 (默认, 1-300秒)
+    format: aac (默认, M4A) / wav
+    """
+    duration = int(args[0]) if args and args[0].isdigit() else 10
+    fmt = args[1] if len(args) > 1 else "aac"
+    print(text_of(call_tool("record_audio", {
+        "duration": duration,
+        "format": fmt,
+    })))
+
+
+def cmd_captures(_args):
+    """列出所有拍摄文件。"""
+    print(text_of(call_tool("list_captures")))
+
+
+def cmd_delete(args):
+    """删除拍摄文件: delete <filename> [category]
+    category: photos (默认) / videos / audio
+    """
+    if not args:
+        print("用法: delete <filename> [category]", file=sys.stderr)
+        sys.exit(1)
+    filename = args[0]
+    category = args[1] if len(args) > 1 else "photos"
+    print(text_of(call_tool("delete_capture", {
+        "filename": filename,
+        "category": category,
+    })))
+
+
 COMMANDS = {
     "call": cmd_call,
     "timeline": cmd_timeline,
@@ -279,11 +381,19 @@ COMMANDS = {
     "progress": cmd_progress,
     "skills": cmd_skills,
     "tools": cmd_tools,
+    # 远程拍照/录像/录音
+    "grant": cmd_grant,
+    "photo": cmd_photo,
+    "video": cmd_video,
+    "audio": cmd_audio,
+    "captures": cmd_captures,
+    "delete": cmd_delete,
 }
 
 
 def main():
     reconfigure_stdout()
+    check_env()
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         sys.exit(1)

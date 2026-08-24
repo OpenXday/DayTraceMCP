@@ -1,7 +1,7 @@
 ---
 name: daytrace-mcp
 version: 0.3.1
-description: 通过 DayTrace MCP Server（远程 Streamable HTTP 端点）连接手机使用轨迹数据，生成各类报表。触发场景：用户说"总结我的一天/按时间线总结""按 app 总结""按联系人/会话总结""周报/本周总结""联系人排行榜""增量分析/自上次以来的变化/新增了什么""最近消息""搜索某关键词""消息统计""导出/推送今天的时间线"等，或任何需要查询手机通知、消息、App 使用记录并汇总的需求。
+description: 通过 DayTrace MCP Server（远程 Streamable HTTP 端点）连接手机使用轨迹数据，生成各类报表；还支持远程拍照、录像、录音。触发场景：用户说"总结我的一天/按时间线总结""按 app 总结""按联系人/会话总结""周报/本周总结""联系人排行榜""增量分析/自上次以来的变化/新增了什么""最近消息""搜索某关键词""消息统计""导出/推送今天的时间线""拍照""录像""录音""前置/后置摄像头"等，或任何需要查询手机通知、消息、App 使用记录并汇总，或远程采集照片/视频/音频的需求。
 argument-hint: [报表类型，如 timeline/app/conversation/search/stats/export，可选日期或关键词]
 allowed-tools: bash, fetch_output, read_file
 ---
@@ -79,7 +79,9 @@ curl -s -X POST "$MCP_URL" -H "Content-Type: application/json" \
 返回 `result.content[0].text` 即结果正文。curl 传中文参数时建议用
 python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 
-## 3. 工具目录（16 个方法）
+## 3. 工具目录（23 个方法）
+
+### 消息查询与时间线（16 个）
 
 | 工具 | 参数 | 用途 |
 |------|------|------|
@@ -99,6 +101,28 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 | `load_skill` | `skillId`(必填) | 激活某个上传 Skill |
 | `import_skill` | `url`(必填) | 从网络 URL 导入 .skill.md |
 | `clear_all_messages` | 无 | ⚠️ 危险：删除全部记录，**绝不调用** |
+
+### 远程拍照 / 录像 / 录音（7 个）
+
+| 工具 | 参数 | 用途 |
+|------|------|------|
+| `take_photo` | `camera`(back/front), `resolution`(720p/1080p/4k/max/WxH), `flash`(off/on/auto) | 远程拍照，返回 Base64 JPEG + 拍摄参数（焦距/ISO/曝光/光圈/白平衡） |
+| `record_video` | `camera`(back/front), `duration`(1-60秒), `resolution`(720p/1080p/480p), `returnBase64`(bool) | 录像，默认 6s 720p MP4（含音频），返回下载 URL 或 Base64 |
+| `record_audio` | `duration`(1-300秒), `format`(aac/wav) | 录音，默认 10s AAC/M4A，返回 Base64 音频 |
+| `list_captures` | 无 | 列出设备上所有已拍摄的照片/视频/音频文件 |
+| `delete_capture` | `filename`(必填), `category`(photos/videos/audio) | 按文件名删除拍摄文件 |
+| `grant_camera_mic_permissions` | 无 | 通过 Shizuku 自动授予 CAMERA 和 RECORD_AUDIO 权限（pm grant） |
+
+> **权限要求**：使用拍照/录像/录音工具前，必须先授予相机和麦克风权限。
+> 首次使用时调 `grant_camera_mic_permissions`（需 Shizuku 运行且已授权），
+> 或在 App 首页「一键开启所有权限」中自动授权，也可手动在系统设置中授予。
+>
+> **文件下载**：拍摄的文件可通过 HTTP 下载：
+> - 照片：`GET /captures/photos/<filename>`
+> - 视频：`GET /captures/videos/<filename>`
+> - 音频：`GET /captures/audio/<filename>`
+>
+> **文件存储位置**：`Android/data/com.daytrace/files/captures/{photos,videos,audio}/`
 
 **日期换算**：`date` 用 `YYYY-MM-DD`；`get_messages_by_date` 用毫秒时间戳
 （本地时区 00:00:00 ~ 23:59:59.999）。可用
@@ -193,3 +217,104 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 - **隐私**：记录含对话内容，报表只在用户要求范围内呈现，不外传。
 - **clear_all_messages 是毁灭性操作**，任何情况下都不调用。
 - 汇报结果时说明数据口径（如"全量累计 vs 单日"），避免误导。
+
+## 6. 远程拍照 / 录像 / 录音
+
+### 6.1 权限准备
+
+首次使用拍照/录像/录音功能前，必须确保相机和麦克风权限已授予：
+
+```bash
+# 方法1：通过 Shizuku 自动授权（推荐）
+python daytrace.py grant
+
+# 方法2：裸 curl
+# 先 initialize，再调 grant_camera_mic_permissions
+curl -s -X POST "$MCP_URL" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grant_camera_mic_permissions","arguments":{}}}'
+```
+
+> 也可在 DayTrace App 首页点击「一键开启所有权限」按钮，会自动通过 Shizuku
+> 授予无障碍、通知监听、相机、麦克风四项权限。
+
+### 6.2 拍照
+
+```bash
+# 后置摄像头，1080p（默认）
+python daytrace.py photo back 1080p
+
+# 前置摄像头，720p，开闪光灯
+python daytrace.py photo front 720p on
+
+# 裸 curl
+curl -s -X POST "$MCP_URL" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"take_photo","arguments":{"camera":"back","resolution":"1080p"}}}'
+```
+
+返回结果包含：
+- 拍摄参数：分辨率、摄像头方向、闪光灯模式
+- 硬件参数：焦距、ISO、曝光时间、光圈值、白平衡状态
+- Base64 编码的 JPEG 图片数据
+- 下载 URL：`http://<设备>/captures/photos/<文件名>`
+
+分辨率选项：`720p` / `1080p`(默认) / `4k` / `max` / 自定义 `WxH`(如 `1920x1080`)
+
+### 6.3 录像
+
+```bash
+# 后置摄像头，6秒，720p（默认）
+python daytrace.py video back 6 720p
+
+# 前置摄像头，10秒，1080p
+python daytrace.py video front 10 1080p
+```
+
+默认返回下载 URL（视频文件较大，不建议 Base64 内嵌）。
+设置 `returnBase64: true` 可获取 Base64 视频数据。
+
+时长：1-60 秒。分辨率：`720p`(默认) / `1080p` / `480p`。
+
+### 6.4 录音
+
+```bash
+# 10秒 AAC 格式（默认）
+python daytrace.py audio 10 aac
+
+# 30秒 WAV 格式
+python daytrace.py audio 30 wav
+```
+
+返回 Base64 编码的音频数据 + 下载 URL。
+时长：1-300 秒。格式：`aac`(默认, M4A 容器) / `wav`。
+
+### 6.5 文件管理
+
+```bash
+# 列出所有拍摄文件
+python daytrace.py captures
+
+# 删除指定文件
+python daytrace.py delete photo_2026-08-24_14-30-00-000.jpg photos
+python daytrace.py delete video_2026-08-24_14-30-00-000.mp4 videos
+python daytrace.py delete audio_2026-08-24_14-30-00-000.m4a audio
+```
+
+### 6.6 下载文件
+
+拍摄的文件可通过 HTTP GET 下载：
+
+```bash
+# 照片
+curl -o photo.jpg -H "Authorization: Bearer $MCP_TOKEN" \
+  "https://<tunnel-url>.trycloudflare.com/captures/photos/<filename>"
+
+# 视频
+curl -o video.mp4 -H "Authorization: Bearer $MCP_TOKEN" \
+  "https://<tunnel-url>.trycloudflare.com/captures/videos/<filename>"
+
+# 音频
+curl -o audio.m4a -H "Authorization: Bearer $MCP_TOKEN" \
+  "https://<tunnel-url>.trycloudflare.com/captures/audio/<filename>"
+```
