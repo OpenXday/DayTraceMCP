@@ -166,15 +166,27 @@ class CameraCaptureManager(private val context: Context) {
 
         val captureLatch = CountDownLatch(1)
         val captureResultRef = AtomicReference<TotalCaptureResult?>()
-        val imageRef = AtomicReference<Image?>()
+        val jpegDataRef = AtomicReference<ByteArray?>()
+        val imageWidthRef = AtomicReference<Int>()
+        val imageHeightRef = AtomicReference<Int>()
         val errorRef = AtomicReference<String?>()
 
-        // ImageReader 回调
+        // ImageReader 回调：在回调线程中立即读取 JPEG 数据，避免 Image 被关闭后无法访问
         imageReader.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage()
             if (image != null) {
-                imageRef.set(image)
                 Log.d(TAG, "Image available")
+                // 立即在回调线程中读取 JPEG bytes，防止后续 imageReader.close() 导致 Image 失效
+                val jpegBytes = imageToJpegBytes(image)
+                imageWidthRef.set(image.width)
+                imageHeightRef.set(image.height)
+                image.close()
+                if (jpegBytes != null) {
+                    jpegDataRef.set(jpegBytes)
+                } else {
+                    errorRef.set("Failed to read JPEG data from image")
+                    Log.e(TAG, "imageToJpegBytes failed in callback")
+                }
             }
         }, backgroundHandler)
 
@@ -345,26 +357,16 @@ class CameraCaptureManager(private val context: Context) {
             return null
         }
 
-        val image = imageRef.get()
+        val jpegData = jpegDataRef.get()
         val captureResult = captureResultRef.get()
 
-        // 清理相机资源
+        // 清理相机资源（此时 JPEG 数据已在回调中读取完毕，安全关闭）
         try { session.stopRepeating() } catch (_: Exception) {}
         camera.close()
         imageReader.close()
 
-        if (image == null) {
-            Log.e(TAG, "No image captured: ${errorRef.get()}")
-            stopBackgroundThread()
-            return null
-        }
-
-        // 读取 JPEG 数据
-        val jpegData = imageToJpegBytes(image)
-        image.close()
-
         if (jpegData == null) {
-            Log.e(TAG, "Failed to read JPEG data")
+            Log.e(TAG, "No image captured: ${errorRef.get()}")
             stopBackgroundThread()
             return null
         }
@@ -384,8 +386,8 @@ class CameraCaptureManager(private val context: Context) {
         val photoResult = PhotoResult(
             file = photoFile,
             mimeType = "image/jpeg",
-            width = image.width,
-            height = image.height,
+            width = imageWidthRef.get() ?: 0,
+            height = imageHeightRef.get() ?: 0,
             fileSize = jpegData.size.toLong(),
             cameraFacing = facing,
             focalLength = extractFocalLength(captureResult, characteristics),
