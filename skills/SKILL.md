@@ -1,6 +1,6 @@
 ---
 name: daytrace-timeline
-version: 0.4.0
+version: 0.4.1
 description: >
   Query phone activity and message data via DayTrace MCP server.
   Use when the user asks about their phone activity, timeline, app usage,
@@ -70,13 +70,13 @@ It changes on each restart.
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `take_screenshot` | Capture a screenshot of the current screen via Shizuku screencap. Returns base64 image + screen metadata. | `format` (png/jpeg), `quality` (1-100), `returnBase64` (bool, default true) |
-| `get_screen_text` | Extract all visible text from the current screen via accessibility service. Text is sorted top-to-bottom by Y position. | `includeBounds` (bool, default false) |
+| `get_screen_text` | Extract all visible text from the current screen via accessibility service. Text is sorted top-to-bottom by Y position. When `includeBounds=true`, returns each element's Rect coordinates (left/top/right/bottom), width, height, and class name for UI automation. | `includeBounds` (bool, default false) |
 
 **Requirements**:
 - `take_screenshot` requires Shizuku running and authorized (for shell screencap command)
 - `get_screen_text` requires the accessibility service enabled (for view hierarchy traversal)
 
-### Device Info & System Control (17)
+### Device Info & System Control (16)
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|

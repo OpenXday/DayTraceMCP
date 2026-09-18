@@ -198,7 +198,7 @@ DayTrace MCP Server 实现了 **MCP Streamable HTTP 传输规范**（协议版�
 | `delete_capture` | 删除指定拍摄文件 |
 | `grant_camera_mic_permissions` | 通过 Shizuku 自动授予相机/麦克风权限 |
 | `take_screenshot` | 截取当前屏幕（通过 Shizuku screencap，返回 Base64 PNG/JPEG + 屏幕分辨率/前台 App） |
-| `get_screen_text` | 提取当前屏幕所有可见文字（通过无障碍服务遍历视图树，按 Y 坐标排序） |
+| `get_screen_text` | 提取当前屏幕所有可见文字（通过无障碍服务遍历视图树，按 Y 坐标排序，可选返回控件坐标与尺寸） |
 | `get_device_info` | 获取设备信息（型号/Android版本/电量/内存/存储/屏幕分辨率/网络状态） |
 | `get_app_usage_stats` | 获取今日 App 使用时长统计（各 App 前台时长排行） |
 | `get_installed_apps` | 列出所有已安装应用（包名+应用名+版本+是否系统App） |
@@ -464,9 +464,17 @@ cd E:\source\typevault
 - `minSdk = 29` (Android 10)
 - `targetSdk = 36` (Android 16)
 - `applicationId = com.daytrace`
-- `versionName = 0.4.0`
+- `versionName = 0.4.1`
 
 ## 更新日志
+
+### v0.4.1
+
+- **增强：`get_screen_text` 支持控件坐标与尺寸**
+  - 新增 `includeBounds` 参数（bool，默认 false）。设为 true 时，返回每个文本元素的完整矩形坐标（left/top/right/bottom）、宽高、所属类名，使 AI 能精确定位屏幕上的文字位置，配合 `tap_screen` 等 UI 操控工具实现自动化操作。
+  - 默认行为不变（仅返回纯文本列表），保持向后兼容。
+- **安全加固**：`android:allowBackup` 设为 `false`，防止通过 adb backup 导出应用数据。
+- **文档更新**：清理文档中隐藏功能（差分上传/Skill 导入）的残留描述，统一 MCP 工具列表与实际实现一致。
 
 ### v0.4.0
 

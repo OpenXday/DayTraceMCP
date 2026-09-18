@@ -1063,9 +1063,9 @@ private fun getClientIp(session: IHTTPSession): String {
             ))
             add(toolJson(
                 name = "get_screen_text",
-                description = "Extract all visible text from the current phone screen. Uses the accessibility service to traverse the view hierarchy and collect text from all nodes, sorted top-to-bottom by Y position. Requires the accessibility service to be enabled.",
+                description = "Extract all visible text from the current phone screen. Uses the accessibility service to traverse the view hierarchy and collect text from all nodes, sorted top-to-bottom by Y position. Set includeBounds=true to get each element's screen coordinates (x, y) and size (width, height) — useful for identifying clickable elements to operate via tap gesture.",
                 properties = buildJsonObject {
-                    put("includeBounds", propObj("boolean", "If true, include bounding box coordinates for each text element (default false)", false))
+                    put("includeBounds", propObj("boolean", "If true, include bounding box coordinates [x,y] and size [WxH] for each text element. Use this to find element positions for tap/swipe operations. Default false.", false))
                 }
             ))
             // === 设备信息 (3) ===
@@ -1682,7 +1682,8 @@ private fun getClientIp(session: IHTTPSession): String {
                 if (!com.daytrace.service.CaptureAccessibilityService.isRunning) {
                     "Error: Accessibility service not running. Enable it in Android Settings or via Shizuku."
                 } else {
-                    val result = screenManager.getScreenText()
+                    val includeBounds = args["includeBounds"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+                    val result = screenManager.getScreenText(includeBounds)
                     if (result != null) {
                         buildString {
                             appendLine("=== Screen Text ===")
@@ -1691,6 +1692,18 @@ private fun getClientIp(session: IHTTPSession): String {
                             appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
                             appendLine()
                             appendLine(result.text)
+                            // 如果 includeBounds=true，追加结构化的节点列表（含坐标、尺寸）
+                            result.nodes?.let { nodes ->
+                                if (nodes.isNotEmpty()) {
+                                    appendLine()
+                                    appendLine("=== Elements with Bounds ===")
+                                    appendLine("format: [x,y] WxH \"text\" (source)")
+                                    appendLine("---")
+                                    nodes.forEach { n ->
+                                        appendLine("[${n.left},${n.top}] ${n.width}x${n.height} \"${n.text}\" (${n.source})")
+                                    }
+                                }
+                            }
                         }
                     } else {
                         "Error: Failed to extract screen text. Accessibility service may not have focus."

@@ -19,8 +19,6 @@ DayTrace MCP 命令行助手 —— 配合 daytrace-mcp SKILL 使用。
   python daytrace.py recent [limit] [direction] [app]
   python daytrace.py messages <start> <end>       # 日期区间(ISO 或毫秒)
   python daytrace.py export [date]                # 导出时间线
-  python daytrace.py progress [date]              # 上传进度
-  python daytrace.py skills                       # 上传 Skill 列表
   python daytrace.py tools                        # 工具清单
   # 远程拍照/录像/录音
   python daytrace.py grant                        # 通过 Shizuku 授予相机/麦克风权限
@@ -282,15 +280,6 @@ def cmd_export(args):
     print(text_of(call_tool("export_timeline", {"date": date})))
 
 
-def cmd_progress(args):
-    date = args[0] if args else ""
-    print(text_of(call_tool("get_upload_progress", {"date": date})))
-
-
-def cmd_skills(_args):
-    print(text_of(call_tool("list_skills")))
-
-
 def cmd_tools(_args):
     print(text_of(call_tool("tools/list", {}, rid=0)))
 
@@ -530,8 +519,6 @@ COMMANDS = {
     "recent": cmd_recent,
     "messages": cmd_messages,
     "export": cmd_export,
-    "progress": cmd_progress,
-    "skills": cmd_skills,
     "tools": cmd_tools,
     # 远程拍照/录像/录音
     "grant": cmd_grant,

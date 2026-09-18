@@ -182,7 +182,7 @@ class ScreenCaptureManager(private val context: Context) {
      *
      * @return [ScreenTextResult] 包含完整文字内容和元信息；如果无障碍服务未运行返回 null
      */
-    fun getScreenText(): ScreenTextResult? {
+    fun getScreenText(includeBounds: Boolean = false): ScreenTextResult? {
         // 检查无障碍服务是否运行
         if (!CaptureAccessibilityService.isRunning) {
             Log.w(TAG, "getScreenText: accessibility service not running")
@@ -224,8 +224,35 @@ class ScreenCaptureManager(private val context: Context) {
         // 按 Y 坐标排序（从上到下）
         textNodes.sortBy { it.bounds.top }
 
-        // 构建输出：每条文本一行
-        val fullText = textNodes.joinToString("\n") { it.text }
+        // 构建输出
+        val fullText = if (includeBounds) {
+            // 带坐标格式：每条文本附带 [left,top]x[width,height]
+            textNodes.joinToString("\n") { node ->
+                val w = node.bounds.width()
+                val h = node.bounds.height()
+                "[$node.bounds.left,${node.bounds.top}]x[${w}x${h}] ${node.text}"
+            }
+        } else {
+            textNodes.joinToString("\n") { it.text }
+        }
+
+        // 如果 includeBounds=true，构建带坐标的节点列表
+        val nodesWithBounds = if (includeBounds) {
+            textNodes.map { node ->
+                TextNodeWithBounds(
+                    text = node.text,
+                    left = node.bounds.left,
+                    top = node.bounds.top,
+                    right = node.bounds.right,
+                    bottom = node.bounds.bottom,
+                    width = node.bounds.width(),
+                    height = node.bounds.height(),
+                    source = node.source
+                )
+            }
+        } else {
+            null
+        }
 
         // 获取前台 App
         val foregroundPackage = CaptureAccessibilityService.lastForegroundPackage ?: "unknown"
@@ -234,7 +261,8 @@ class ScreenCaptureManager(private val context: Context) {
             text = fullText,
             nodeCount = textNodes.size,
             foregroundPackage = foregroundPackage,
-            timestamp = System.currentTimeMillis()
+            timestamp = System.currentTimeMillis(),
+            nodes = nodesWithBounds
         )
     }
 
@@ -385,7 +413,21 @@ class ScreenCaptureManager(private val context: Context) {
         val text: String,
         val nodeCount: Int,
         val foregroundPackage: String,
-        val timestamp: Long
+        val timestamp: Long,
+        /** 带坐标的文本节点列表（仅当 includeBounds=true 时填充） */
+        val nodes: List<TextNodeWithBounds>? = null
+    )
+
+    /** 带坐标信息的文本节点（供 MCP 返回） */
+    data class TextNodeWithBounds(
+        val text: String,
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+        val width: Int,
+        val height: Int,
+        val source: String  // "text" or "desc"
     )
 
     /** 文本节点（内部使用） */

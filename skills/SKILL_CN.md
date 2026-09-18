@@ -1,8 +1,14 @@
 ---
 name: daytrace-mcp
-version: 0.4.0
-description: 通过 DayTrace MCP Server（远程 Streamable HTTP 端点）连接手机使用轨迹数据，生成各类报表；还支持远程拍照、录像、录音。触发场景：用户说"总结我的一天/按时间线总结""按 app 总结""按联系人/会话总结""周报/本周总结""联系人排行榜""增量分析/自上次以来的变化/新增了什么""最近消息""搜索某关键词""消息统计""导出/推送今天的时间线""拍照""录像""录音""前置/后置摄像头"等，或任何需要查询手机通知、消息、App 使用记录并汇总，或远程采集照片/视频/音频的需求。
-argument-hint: [报表类型，如 timeline/app/conversation/search/stats/export，可选日期或关键词]
+version: 0.4.1
+description: >
+  通过 DayTrace MCP Server（远程 Streamable HTTP 端点）连接手机使用轨迹数据，生成各类报表；
+  还支持远程拍照、录像、录音。触发场景：用户说"总结我的一天/按时间线总结""按 app 总结"
+  "按联系人/会话总结""周报/本周总结""联系人排行榜""增量分析/自上次以来的变化/新增了什么"
+  "最近消息""搜索某关键词""消息统计""导出/推送今天的时间线""拍照""录像""录音""前置/后置摄像头"等，
+  或任何需要查询手机通知、消息、App 使用记录并汇总，或远程采集照片/视频/音频的需求。
+  也支持远程 UI 操控（截图、提取屏幕文字与控件坐标、点击、输入、滑动、按键、打开 App）。
+argument-hint: "[报表类型，如 timeline/app/conversation/search/stats/export，可选日期或关键词]"
 allowed-tools: bash, fetch_output, read_file
 ---
 
@@ -48,14 +54,14 @@ python daytrace.py search 关键词示例
 # 最近消息 / 日期区间（ISO 时间或毫秒时间戳）
 python daytrace.py recent 50 all
 python daytrace.py messages "2026-01-01 09:00:00" "2026-01-01 23:59:59"
-# 导出 / 上传进度 / 上传 Skill 列表
+# 导出
 python daytrace.py export 2026-01-01
-python daytrace.py progress 2026-01-01
-python daytrace.py skills
 ```
 
 环境变量 `DAYTRACE_URL` / `DAYTRACE_TOKEN` **必填**（连接端点与认证凭据，
-不在文档中内置）。示例：
+不在文档中内置）。
+
+示例：
 
 ```bash
 DAYTRACE_URL=https://<mcp-endpoint>/mcp DAYTRACE_TOKEN=<token> \
@@ -79,9 +85,9 @@ curl -s -X POST "$MCP_URL" -H "Content-Type: application/json" \
 返回 `result.content[0].text` 即结果正文。curl 传中文参数时建议用
 python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 
-## 3. 工具目录（23 个方法）
+## 3. 工具目录（35 个方法）
 
-### 消息查询与时间线（16 个）
+### 消息查询与时间线（11 个）
 
 | 工具 | 参数 | 用途 |
 |------|------|------|
@@ -95,14 +101,9 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 | `get_conversation` | `appPackage`(必填), `contactOrGroup`, `limit`(默认200,最大1000) | 某 App 内单联系人/群的完整对话（按时间正序） |
 | `export_timeline` | `date` | 在设备端导出时间线为 Markdown 文件，返回文件路径 |
 | `push_webhook_summary` | `date` | 把当天总结推送到已配置 Webhook（如 Chanify） |
-| `push_timeline_diff` | `date`, `forceFull` | 增量上传时间线到已加载的上传 Skill |
-| `get_upload_progress` | `date` | 查询某天上传进度 |
-| `list_skills` | 无 | 列出可用的上传 Skill（内置 + 导入的 .skill.md） |
-| `load_skill` | `skillId`(必填) | 激活某个上传 Skill |
-| `import_skill` | `url`(必填) | 从网络 URL 导入 .skill.md |
 | `clear_all_messages` | 无 | ⚠️ 危险：删除全部记录，**绝不调用** |
 
-### 远程拍照 / 录像 / 录音（7 个）
+### 远程拍照 / 录像 / 录音（6 个）
 
 | 工具 | 参数 | 用途 |
 |------|------|------|
@@ -118,19 +119,13 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 | 工具 | 参数 | 用途 |
 |------|------|------|
 | `take_screenshot` | `format`(png/jpeg), `quality`(1-100), `returnBase64`(bool) | 通过 Shizuku screencap 截取当前屏幕，返回 Base64 图片 + 屏幕分辨率/前台 App |
-| `get_screen_text` | `includeBounds`(bool) | 通过无障碍服务遍历视图树，提取当前屏幕所有可见文字（按 Y 坐标排序） |
+| `get_screen_text` | `includeBounds`(bool, 默认false) | 通过无障碍服务遍历视图树，提取当前屏幕所有可见文字（按 Y 坐标排序）。`includeBounds=true` 时返回每个元素的完整矩形坐标（left/top/right/bottom）、宽高、类名，便于配合 `tap_screen` 实现 UI 自动化 |
 
 > **权限要求**：
 > - `take_screenshot` 需要 Shizuku 运行且已授权（用于执行 screencap 命令）
 > - `get_screen_text` 需要无障碍服务已开启（用于遍历视图树提取文字）
->
-> **权限要求**：
-> - `take_screenshot` / `take_screenshot_region` / `tap_screen` / `input_text` / `press_key` / `swipe` / `open_app` 需要 Shizuku 运行且已授权
-> - `get_screen_text` / `get_screen_interactive_elements` 需要无障碍服务已开启
-> - `send_text_message` 需要 SEND_SMS 权限（可通过 Shizuku `pm grant` 授予）
-> - `get_app_usage_stats` 需要 PACKAGE_USAGE_STATS 权限（可通过 Shizuku 授予）
 
-### 设备信息 / 系统操作（17 个）
+### 设备信息 / 系统操作（16 个）
 
 | 工具 | 参数 | 用途 |
 |------|------|------|
@@ -150,9 +145,14 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 | `press_key` | `key`(必填) | 模拟按键（home/back/recent/volume_up/volume_down等） |
 | `swipe` | `startX`,`startY`,`endX`,`endY`(必填), `durationMs` | 模拟滑动手势 |
 | `open_app` | `packageName`(必填), `activity` | 远程打开 App |
-| `get_contact_stats` | 无 | 获取联系人排行榜（谁消息最多） |
 
 > **可用按键列表**（`press_key`）：home, back, recent, menu, power, volume_up, volume_down, volume_mute, delete, enter, escape, tab, space, search, camera, call, end_call, notification, screenshot
+
+> **权限要求**：
+> - `take_screenshot` / `take_screenshot_region` / `tap_screen` / `input_text` / `press_key` / `swipe` / `open_app` 需要 Shizuku 运行且已授权
+> - `get_screen_text` / `get_screen_interactive_elements` 需要无障碍服务已开启
+> - `send_text_message` 需要 SEND_SMS 权限（可通过 Shizuku `pm grant` 授予）
+> - `get_app_usage_stats` 需要 PACKAGE_USAGE_STATS 权限（可通过 Shizuku 授予）
 
 > **权限要求**：使用拍照/录像/录音工具前，必须先授予相机和麦克风权限。
 > 首次使用时调 `grant_camera_mic_permissions`（需 Shizuku 运行且已授权），
@@ -210,8 +210,6 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 ### 4.5 导出 / 推送
 - 设备端落盘：`export_timeline`（返回路径，告知用户）。
 - 推 Webhook：`push_webhook_summary`（返回成功/失败）。
-- 增量上传：先 `list_skills` 看有哪些上传 Skill → `load_skill` 激活 →
-  `push_timeline_diff`；用 `get_upload_progress` 确认进度。
 
 ### 4.6 周报（按时间线周总结）
 1. 确认周范围（默认最近 7 天，含今天；或用户指定起止日期）。
@@ -232,21 +230,16 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 
 1. **确定基线**：先确认上次分析的截止时间（用户告知，或按上次报表的
    结束时间推算；没有基线则退化为全量分析，并说明口径）。
-2. **增量同步（设备侧）**：`list_skills` 看可用上传 Skill → `load_skill`
-   激活 → `push_timeline_diff`（默认只发增量，`forceFull` 强制全量）→
-   `get_upload_progress` 确认已上传/待上传量。适用于把新记录增量备份到
-   Biji/OpenAPI/Webhook 等目标，按 日期+时间 命名防覆盖。
-3. **增量读取（分析侧）**：
+2. **增量读取（分析侧）**：
    - `get_messages_by_date`：`startTime` = 基线时刻毫秒时间戳，
      `endTime` = 现在，只取新增记录；数据大仍要分段读完。
    - 或逐日 `get_timeline` 对比：只处理基线之后那几天。
-4. **增量对比与输出**：
+3. **增量对比与输出**：
    - 新增：新消息/新通知/新联系人（对比 `list_conversations` 基线前后
      的会话集合）、新任务与截止时间。
    - 变化：消息量、App 使用、某话题/联系人的频次升降（对比基线）。
    - 输出格式：分析区间（基线 ~ 现在）/ 新增条数 / 变化要点表 /
      相比基线的新增待办与提醒。
-
 
 ## 5. 注意事项
 
