@@ -83,8 +83,8 @@ object ShizukuHelper {
                 }
             }
 
-            val output = process.inputStream.bufferedReader().readText()
-            val error = process.errorStream.bufferedReader().readText()
+            val output = process.inputStream.bufferedReader(Charsets.UTF_8).readText()
+            val error = process.errorStream.bufferedReader(Charsets.UTF_8).readText()
             val exitCode = process.waitFor()
 
             Log.d(TAG, "execShell result: exit=$exitCode, out=${output.take(200)}, err=${error.take(200)}")
@@ -264,24 +264,70 @@ object ShizukuHelper {
         }
     }
 
-    /** 检查无障碍服务是否已启用 */
+    /**
+     * 检查无障碍服务是否已启用
+     *
+     * 多重检测策略（按可靠性排序）：
+     * 1. 静态标志位 isRunning：服务进程内直接标记，最准确反映服务实际运行状态
+     * 2. Settings.Secure 字符串检查：作为 fallback，覆盖服务未启动但已配置的场景
+     *
+     * 背景：长时间运行后，Settings.Secure 中的 enabled_accessibility_services
+     * 可能与实际服务运行状态不同步（系统内部缓存偏差），导致"服务在跑但状态显示未开启"。
+     * 关闭再开启后恢复正常，因为重新写入触发了同步。
+     * 静态标志位不受此问题影响。
+     */
     fun isAccessibilityEnabled(context: Context, serviceClass: Class<*>): Boolean {
+        // 1. 优先检查服务进程内的静态标志位
+        if (serviceClass == com.daytrace.service.CaptureAccessibilityService::class.java) {
+            if (com.daytrace.service.CaptureAccessibilityService.isRunning) {
+                return true
+            }
+        }
+
+        // 2. Fallback: 检查 Settings.Secure 中的服务列表
         val expected = ComponentName(context, serviceClass).flattenToString()
         val enabled = Settings.Secure.getString(
             context.contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
-        return enabled.contains(expected)
+
+        val inSettings = enabled.contains(expected)
+
+        // 诊断日志：静态标志位为 false 但 Settings 中存在（可能服务刚被系统回收）
+        if (!inSettings) {
+            Log.w(TAG, "isAccessibilityEnabled: service not in Settings.Secure (expected=$expected, enabled=$enabled)")
+        }
+
+        return inSettings
     }
 
-    /** 检查通知监听是否已启用 */
+    /**
+     * 检查通知监听是否已启用
+     *
+     * 同无障碍服务，采用双重检测：
+     * 1. 静态标志位 isRunning：最准确反映服务实际运行状态
+     * 2. Settings.Secure 字符串检查：作为 fallback
+     */
     fun isNotificationListenerEnabled(context: Context): Boolean {
+        // 1. 优先检查服务进程内的静态标志位
+        if (com.daytrace.service.NotificationCaptureService.isRunning) {
+            return true
+        }
+
+        // 2. Fallback: 检查 Settings.Secure 中的服务列表
         val flat = ComponentName(context, com.daytrace.service.NotificationCaptureService::class.java).flattenToString()
         val enabled = Settings.Secure.getString(
             context.contentResolver,
             "enabled_notification_listeners"
         ) ?: return false
-        return enabled.contains(flat)
+
+        val inSettings = enabled.contains(flat)
+
+        if (!inSettings) {
+            Log.w(TAG, "isNotificationListenerEnabled: service not in Settings.Secure (expected=$flat, enabled=$enabled)")
+        }
+
+        return inSettings
     }
 
     // === 运行时权限（相机/录音）===

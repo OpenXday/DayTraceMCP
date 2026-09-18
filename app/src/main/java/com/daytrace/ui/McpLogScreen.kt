@@ -453,8 +453,8 @@ fun McpLogItem(log: McpLogEntry, onClick: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // 方法标签（空方法名显示 None）
-                val displayMethod = log.rpcMethod.ifEmpty { "None" }
+                // 方法标签（空方法名显示 — 表示未进入 RPC 路由）
+                val displayMethod = log.rpcMethod.ifEmpty { "—" }
                 Surface(
                     color = methodColor.copy(alpha = 0.15f),
                     shape = RoundedCornerShape(4.dp)

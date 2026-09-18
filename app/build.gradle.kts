@@ -14,8 +14,8 @@ android {
         applicationId = "com.daytrace"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.3.1"
+        versionCode = 3
+        versionName = "0.4.0"
     }
 
     buildTypes {

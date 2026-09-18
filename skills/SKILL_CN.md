@@ -1,6 +1,6 @@
 ---
 name: daytrace-mcp
-version: 0.3.1
+version: 0.4.0
 description: 通过 DayTrace MCP Server（远程 Streamable HTTP 端点）连接手机使用轨迹数据，生成各类报表；还支持远程拍照、录像、录音。触发场景：用户说"总结我的一天/按时间线总结""按 app 总结""按联系人/会话总结""周报/本周总结""联系人排行榜""增量分析/自上次以来的变化/新增了什么""最近消息""搜索某关键词""消息统计""导出/推送今天的时间线""拍照""录像""录音""前置/后置摄像头"等，或任何需要查询手机通知、消息、App 使用记录并汇总，或远程采集照片/视频/音频的需求。
 argument-hint: [报表类型，如 timeline/app/conversation/search/stats/export，可选日期或关键词]
 allowed-tools: bash, fetch_output, read_file
@@ -109,9 +109,50 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 | `take_photo` | `camera`(back/front), `resolution`(720p/1080p/4k/max/WxH), `flash`(off/on/auto) | 远程拍照，返回 Base64 JPEG + 拍摄参数（焦距/ISO/曝光/光圈/白平衡） |
 | `record_video` | `camera`(back/front), `duration`(1-60秒), `resolution`(720p/1080p/480p), `returnBase64`(bool) | 录像，默认 6s 720p MP4（含音频），返回下载 URL 或 Base64 |
 | `record_audio` | `duration`(1-300秒), `format`(aac/wav) | 录音，默认 10s AAC/M4A，返回 Base64 音频 |
-| `list_captures` | 无 | 列出设备上所有已拍摄的照片/视频/音频文件 |
-| `delete_capture` | `filename`(必填), `category`(photos/videos/audio) | 按文件名删除拍摄文件 |
+| `list_captures` | 无 | 列出设备上所有已拍摄的照片/视频/音频/截屏文件 |
+| `delete_capture` | `filename`(必填), `category`(photos/videos/audio/screenshots) | 按文件名删除拍摄文件 |
 | `grant_camera_mic_permissions` | 无 | 通过 Shizuku 自动授予 CAMERA 和 RECORD_AUDIO 权限（pm grant） |
+
+### 屏幕截图 / 屏幕文字（2 个）
+
+| 工具 | 参数 | 用途 |
+|------|------|------|
+| `take_screenshot` | `format`(png/jpeg), `quality`(1-100), `returnBase64`(bool) | 通过 Shizuku screencap 截取当前屏幕，返回 Base64 图片 + 屏幕分辨率/前台 App |
+| `get_screen_text` | `includeBounds`(bool) | 通过无障碍服务遍历视图树，提取当前屏幕所有可见文字（按 Y 坐标排序） |
+
+> **权限要求**：
+> - `take_screenshot` 需要 Shizuku 运行且已授权（用于执行 screencap 命令）
+> - `get_screen_text` 需要无障碍服务已开启（用于遍历视图树提取文字）
+>
+> **权限要求**：
+> - `take_screenshot` / `take_screenshot_region` / `tap_screen` / `input_text` / `press_key` / `swipe` / `open_app` 需要 Shizuku 运行且已授权
+> - `get_screen_text` / `get_screen_interactive_elements` 需要无障碍服务已开启
+> - `send_text_message` 需要 SEND_SMS 权限（可通过 Shizuku `pm grant` 授予）
+> - `get_app_usage_stats` 需要 PACKAGE_USAGE_STATS 权限（可通过 Shizuku 授予）
+
+### 设备信息 / 系统操作（17 个）
+
+| 工具 | 参数 | 用途 |
+|------|------|------|
+| `get_device_info` | 无 | 获取设备信息（型号/Android版本/电量/内存/存储/屏幕分辨率/网络状态） |
+| `get_app_usage_stats` | 无 | 获取今日 App 使用时长统计（各 App 前台时长排行） |
+| `get_installed_apps` | `includeSystem`(bool) | 列出所有已安装应用（包名+应用名+版本+是否系统App） |
+| `get_battery_history` | 无 | 获取电池详细信息（电量/充电状态/健康/温度/电压） |
+| `get_clipboard` | 无 | 读取系统剪贴板内容 |
+| `set_clipboard` | `text`(必填) | 写入内容到系统剪贴板 |
+| `send_notification` | `title`(必填), `message`(必填), `priority`(low/default/high) | 发送本地通知到手机 |
+| `get_notification_log` | `limit`(1-100) | 获取最近通知历史（通知监听服务内存缓存） |
+| `send_text_message` | `phoneNumber`(必填), `message`(必填) | 发送短信 |
+| `take_screenshot_region` | `left`,`top`,`right`,`bottom`(必填), `format`,`quality` | 截取屏幕指定区域 |
+| `get_screen_interactive_elements` | 无 | 提取屏幕所有可交互元素（按钮/输入框等，含坐标） |
+| `tap_screen` | `x`,`y`(必填) | 模拟点击屏幕坐标 |
+| `input_text` | `text`(必填) | 在当前焦点输入框输入文字（ASCII直接输入，中文通过剪贴板粘贴） |
+| `press_key` | `key`(必填) | 模拟按键（home/back/recent/volume_up/volume_down等） |
+| `swipe` | `startX`,`startY`,`endX`,`endY`(必填), `durationMs` | 模拟滑动手势 |
+| `open_app` | `packageName`(必填), `activity` | 远程打开 App |
+| `get_contact_stats` | 无 | 获取联系人排行榜（谁消息最多） |
+
+> **可用按键列表**（`press_key`）：home, back, recent, menu, power, volume_up, volume_down, volume_mute, delete, enter, escape, tab, space, search, camera, call, end_call, notification, screenshot
 
 > **权限要求**：使用拍照/录像/录音工具前，必须先授予相机和麦克风权限。
 > 首次使用时调 `grant_camera_mic_permissions`（需 Shizuku 运行且已授权），
@@ -121,8 +162,9 @@ python/JSON 构造请求体（见 daytrace.py），避免 shell 编码问题。
 > - 照片：`GET /captures/photos/<filename>`
 > - 视频：`GET /captures/videos/<filename>`
 > - 音频：`GET /captures/audio/<filename>`
+> - 截屏：`GET /captures/screenshots/<filename>`
 >
-> **文件存储位置**：`Android/data/com.daytrace/files/captures/{photos,videos,audio}/`
+> **文件存储位置**：`Android/data/com.daytrace/files/captures/{photos,videos,audio,screenshots}/`
 
 **日期换算**：`date` 用 `YYYY-MM-DD`；`get_messages_by_date` 用毫秒时间戳
 （本地时区 00:00:00 ~ 23:59:59.999）。可用

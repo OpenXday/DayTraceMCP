@@ -354,7 +354,7 @@ def cmd_captures(_args):
 
 def cmd_delete(args):
     """删除拍摄文件: delete <filename> [category]
-    category: photos (默认) / videos / audio
+    category: photos (默认) / videos / audio / screenshots
     """
     if not args:
         print("用法: delete <filename> [category]", file=sys.stderr)
@@ -365,6 +365,158 @@ def cmd_delete(args):
         "filename": filename,
         "category": category,
     })))
+
+
+def cmd_screenshot(args):
+    """截屏: screenshot [format] [quality]
+    format: png (默认, 无损) / jpeg (压缩)
+    quality: 80 (默认, 1-100, 仅 jpeg)
+    """
+    fmt = args[0] if args else "png"
+    quality = int(args[1]) if len(args) > 1 and args[1].isdigit() else 80
+    print(text_of(call_tool("take_screenshot", {
+        "format": fmt,
+        "quality": quality,
+    })))
+
+
+def cmd_screen_text(_args):
+    """提取当前屏幕文字。"""
+    print(text_of(call_tool("get_screen_text")))
+
+
+def cmd_device_info(_args):
+    """获取设备信息。"""
+    print(text_of(call_tool("get_device_info")))
+
+
+def cmd_usage_stats(_args):
+    """获取今日 App 使用时长统计。"""
+    print(text_of(call_tool("get_app_usage_stats")))
+
+
+def cmd_installed_apps(args):
+    """列出已安装应用: installed_apps [include_system]
+    include_system: true/false (默认 false)
+    """
+    inc_sys = args[0].lower() == "true" if args else False
+    print(text_of(call_tool("get_installed_apps", {"includeSystem": inc_sys})))
+
+
+def cmd_battery(_args):
+    """获取电池信息。"""
+    print(text_of(call_tool("get_battery_history")))
+
+
+def cmd_clipboard(_args):
+    """读取剪贴板。"""
+    print(text_of(call_tool("get_clipboard")))
+
+
+def cmd_set_clipboard(args):
+    """写入剪贴板: set_clipboard <text>"""
+    if not args:
+        print("用法: set_clipboard <text>", file=sys.stderr)
+        sys.exit(1)
+    print(text_of(call_tool("set_clipboard", {"text": " ".join(args)})))
+
+
+def cmd_notify(args):
+    """发送通知: notify <title> <message> [priority]
+    priority: low/default/high (默认 default)
+    """
+    if len(args) < 2:
+        print("用法: notify <title> <message> [priority]", file=sys.stderr)
+        sys.exit(1)
+    title = args[0]
+    message = args[1]
+    priority = args[2] if len(args) > 2 else "default"
+    print(text_of(call_tool("send_notification", {
+        "title": title,
+        "message": message,
+        "priority": priority,
+    })))
+
+
+def cmd_notif_log(args):
+    """获取通知历史: notif_log [limit]"""
+    limit = int(args[0]) if args and args[0].isdigit() else 50
+    print(text_of(call_tool("get_notification_log", {"limit": limit})))
+
+
+def cmd_sms(args):
+    """发送短信: sms <phone_number> <message>"""
+    if len(args) < 2:
+        print("用法: sms <phone_number> <message>", file=sys.stderr)
+        sys.exit(1)
+    phone = args[0]
+    message = " ".join(args[1:])
+    print(text_of(call_tool("send_text_message", {
+        "phoneNumber": phone,
+        "message": message,
+    })))
+
+
+def cmd_tap(args):
+    """点击屏幕: tap <x> <y>"""
+    if len(args) < 2:
+        print("用法: tap <x> <y>", file=sys.stderr)
+        sys.exit(1)
+    print(text_of(call_tool("tap_screen", {
+        "x": int(args[0]),
+        "y": int(args[1]),
+    })))
+
+
+def cmd_input_text(args):
+    """输入文字: input_text <text>"""
+    if not args:
+        print("用法: input_text <text>", file=sys.stderr)
+        sys.exit(1)
+    print(text_of(call_tool("input_text", {"text": " ".join(args)})))
+
+
+def cmd_key(args):
+    """按键: key <key_name>
+    可用: home/back/recent/menu/power/volume_up/volume_down等
+    """
+    if not args:
+        print("用法: key <key_name>", file=sys.stderr)
+        sys.exit(1)
+    print(text_of(call_tool("press_key", {"key": args[0]})))
+
+
+def cmd_swipe(args):
+    """滑动: swipe <startX> <startY> <endX> <endY> [duration_ms]"""
+    if len(args) < 4:
+        print("用法: swipe <startX> <startY> <endX> <endY> [duration_ms]", file=sys.stderr)
+        sys.exit(1)
+    duration = int(args[4]) if len(args) > 4 and args[4].isdigit() else 300
+    print(text_of(call_tool("swipe", {
+        "startX": int(args[0]),
+        "startY": int(args[1]),
+        "endX": int(args[2]),
+        "endY": int(args[3]),
+        "durationMs": duration,
+    })))
+
+
+def cmd_open_app(args):
+    """打开 App: open_app <package_name> [activity]"""
+    if not args:
+        print("用法: open_app <package_name> [activity]", file=sys.stderr)
+        sys.exit(1)
+    pkg = args[0]
+    activity = args[1] if len(args) > 1 else ""
+    print(text_of(call_tool("open_app", {
+        "packageName": pkg,
+        "activity": activity,
+    })))
+
+
+def cmd_interactive(_args):
+    """提取屏幕可交互元素。"""
+    print(text_of(call_tool("get_screen_interactive_elements")))
 
 
 COMMANDS = {
@@ -388,6 +540,25 @@ COMMANDS = {
     "audio": cmd_audio,
     "captures": cmd_captures,
     "delete": cmd_delete,
+    # 屏幕截图/文字
+    "screenshot": cmd_screenshot,
+    "screen_text": cmd_screen_text,
+    # 设备信息/系统操作
+    "device": cmd_device_info,
+    "usage": cmd_usage_stats,
+    "installed": cmd_installed_apps,
+    "battery": cmd_battery,
+    "clipboard": cmd_clipboard,
+    "set_clipboard": cmd_set_clipboard,
+    "notify": cmd_notify,
+    "notif_log": cmd_notif_log,
+    "sms": cmd_sms,
+    "tap": cmd_tap,
+    "input_text": cmd_input_text,
+    "key": cmd_key,
+    "swipe": cmd_swipe,
+    "open_app": cmd_open_app,
+    "interactive": cmd_interactive,
 }
 
 

@@ -1,6 +1,6 @@
 ---
 name: daytrace-timeline
-version: 0.3.1
+version: 0.4.0
 description: >
   Query phone activity and message data via DayTrace MCP server.
   Use when the user asks about their phone activity, timeline, app usage,
@@ -62,8 +62,48 @@ It changes on each restart.
 | `record_video` | Record a short video (default 6s 720p MP4 with audio). Returns download URL or base64. | `camera` (back/front), `duration` (1-60s), `resolution` (720p/1080p/480p), `returnBase64` (bool) |
 | `record_audio` | Record audio from microphone (default 10s AAC/M4A). Returns base64 audio. | `duration` (1-300s), `format` (aac/wav) |
 | `list_captures` | List all captured photos, videos, and audio files on device | none |
-| `delete_capture` | Delete a captured file by filename | `filename` (required), `category` (photos/videos/audio) |
+| `delete_capture` | Delete a captured file by filename | `filename` (required), `category` (photos/videos/audio/screenshots) |
 | `grant_camera_mic_permissions` | Grant CAMERA and RECORD_AUDIO via Shizuku (shell pm grant) | none |
+
+### Screen Capture & Text Extraction
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `take_screenshot` | Capture a screenshot of the current screen via Shizuku screencap. Returns base64 image + screen metadata. | `format` (png/jpeg), `quality` (1-100), `returnBase64` (bool, default true) |
+| `get_screen_text` | Extract all visible text from the current screen via accessibility service. Text is sorted top-to-bottom by Y position. | `includeBounds` (bool, default false) |
+
+**Requirements**:
+- `take_screenshot` requires Shizuku running and authorized (for shell screencap command)
+- `get_screen_text` requires the accessibility service enabled (for view hierarchy traversal)
+
+### Device Info & System Control (17)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `get_device_info` | Get device info: model, Android version, battery, memory, storage, screen, network | none |
+| `get_app_usage_stats` | Get today's app usage stats (foreground time per app) | none |
+| `get_installed_apps` | List all installed apps with package name, version, system flag | `includeSystem` (bool) |
+| `get_battery_history` | Get battery details: level, charging, health, temp, voltage | none |
+| `get_clipboard` | Read system clipboard content | none |
+| `set_clipboard` | Write text to system clipboard | `text` (required) |
+| `send_notification` | Send a local notification to the phone | `title`, `message` (required), `priority` |
+| `get_notification_log` | Get recent notification history (in-memory cache, last 100) | `limit` (1-100) |
+| `send_text_message` | Send SMS to a phone number | `phoneNumber`, `message` (required) |
+| `take_screenshot_region` | Capture a screenshot of a specific screen region | `left`, `top`, `right`, `bottom` (required), `format`, `quality` |
+| `get_screen_interactive_elements` | Extract all clickable buttons/inputs with coordinates | none |
+| `tap_screen` | Simulate a tap at screen coordinates | `x`, `y` (required) |
+| `input_text` | Type text into focused input field (ASCII direct, CJK via clipboard paste) | `text` (required) |
+| `press_key` | Simulate key press (home, back, recent, volume, etc.) | `key` (required) |
+| `swipe` | Simulate swipe gesture | `startX`, `startY`, `endX`, `endY` (required), `durationMs` |
+| `open_app` | Launch an app by package name | `packageName` (required), `activity` |
+
+**Requirements**:
+- `take_screenshot_region` / `tap_screen` / `input_text` / `press_key` / `swipe` / `open_app` require Shizuku
+- `get_screen_interactive_elements` requires accessibility service
+- `send_text_message` requires SEND_SMS permission (grant via Shizuku `pm grant`)
+- `get_app_usage_stats` requires PACKAGE_USAGE_STATS permission
+
+**Available keys for `press_key`**: home, back, recent, menu, power, volume_up, volume_down, volume_mute, delete, enter, escape, tab, space, search, camera, call, end_call, notification, screenshot
 
 **Permissions**: Camera/mic permissions must be granted before using capture tools.
 Call `grant_camera_mic_permissions` first (requires Shizuku running), or grant manually in Android Settings.
@@ -72,6 +112,7 @@ Call `grant_camera_mic_permissions` first (requires Shizuku running), or grant m
 - Photos: `GET /captures/photos/<filename>`
 - Videos: `GET /captures/videos/<filename>`
 - Audio: `GET /captures/audio/<filename>`
+- Screenshots: `GET /captures/screenshots/<filename>`
 
 ## App Package Names
 

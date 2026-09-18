@@ -37,10 +37,18 @@ class CaptureAccessibilityService : AccessibilityService() {
         @Volatile var isRunning = false
             private set
 
+        /** 当前服务实例（供 MCP Server 等外部调用获取 rootInActiveWindow） */
+        @Volatile var instance: CaptureAccessibilityService? = null
+            private set
+
         /** 定时快照间隔（毫秒）—— 30秒 */
         private const val SNAPSHOT_INTERVAL_MS = 30_000L
 
-        /** 当前前台 App */
+        /** 当前前台 App（供 MCP Server 读取） */
+        @Volatile var lastForegroundPackage: String? = null
+            private set
+
+        /** 当前前台 App（内部使用，与 lastForegroundPackage 同步） */
         @Volatile private var currentForegroundPackage: String? = null
 
         /** 当前前台 App 进入时间 */
@@ -90,6 +98,7 @@ class CaptureAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         isRunning = true
+        instance = this
         Log.i(TAG, "Accessibility service connected (3-channel timeline mode)")
 
         // 三通道配置：窗口切换 + 文本变化 + 内容变化
@@ -161,6 +170,7 @@ class CaptureAccessibilityService : AccessibilityService() {
                 // 轻量处理：只在内容变化时更新前台包名
                 if (packageName != currentForegroundPackage) {
                     currentForegroundPackage = packageName
+                    lastForegroundPackage = packageName
                     currentAppEnterTime = System.currentTimeMillis()
                 }
             }
@@ -342,6 +352,7 @@ class CaptureAccessibilityService : AccessibilityService() {
         }
 
         currentForegroundPackage = packageName
+        lastForegroundPackage = packageName
         currentAppEnterTime = now
 
         // 记录 App 切换
@@ -430,6 +441,7 @@ class CaptureAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        instance = null
         handler.removeCallbacks(snapshotRunnable)
         handler.removeCallbacks(inputFlushRunnable)
         Log.i(TAG, "Accessibility service destroyed")

@@ -86,6 +86,21 @@ class McpServer(
         AudioCaptureManager(context.applicationContext)
     }
 
+    /** 屏幕截图/文字提取管理器 */
+    private val screenManager by lazy {
+        ScreenCaptureManager(context.applicationContext)
+    }
+
+    /** 设备信息管理器 */
+    private val deviceInfoManager by lazy {
+        DeviceInfoManager(context.applicationContext)
+    }
+
+    /** 系统操作管理器 */
+    private val actionManager by lazy {
+        SystemActionManager(context.applicationContext)
+    }
+
     fun startServer() {
         try {
             start(SOCKET_READ_TIMEOUT, false)
@@ -229,7 +244,7 @@ private fun getClientIp(session: IHTTPSession): String {
             return handleMcpEndpoint(session, method, clientIp, authResult, requestStartTime)
         }
 
-        // 文件下载端点：/captures/photos/<filename>, /captures/videos/<filename>, /captures/audio/<filename>
+        // 文件下载端点：/captures/photos/<filename>, /captures/videos/<filename>, /captures/audio/<filename>, /captures/screenshots/<filename>
         if (uri.startsWith("/captures/") && method == Method.GET) {
             return handleCaptureDownload(uri, clientIp, authResult, requestStartTime)
         }
@@ -481,9 +496,23 @@ private fun getClientIp(session: IHTTPSession): String {
         requestStartTime: Long
     ): Response {
         val body = try {
-            val files = HashMap<String, String>()
-            session.parseBody(files)
-            files["postData"] ?: ""
+            // 不使用 NanoHTTPD 的 parseBody（它用 US-ASCII 解码 postData，导致中文丢失），
+            // 而是直接从 InputStream 读取原始字节，用 UTF-8 解码。
+            // 在 serve() 被调用时，inputStream 的位置已经在 header 之后（body 开始处）。
+            val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
+            if (contentLength > 0) {
+                val rawBytes = ByteArray(contentLength)
+                val inputStream = session.inputStream
+                var offset = 0
+                while (offset < contentLength) {
+                    val read = inputStream.read(rawBytes, offset, contentLength - offset)
+                    if (read < 0) break
+                    offset += read
+                }
+                String(rawBytes, 0, offset, Charsets.UTF_8)
+            } else {
+                ""
+            }
         } catch (e: Exception) {
             val resp = errorResponse(-32700, "Parse error: ${e.message}", null)
             logRecorder.log(
@@ -626,12 +655,25 @@ private fun getClientIp(session: IHTTPSession): String {
         val result = try {
             when (method) {
                 "initialize" -> initializeResult()
-                "initialized" -> buildJsonObject { } // 通知，无需响应
+                "initialized", "notifications/initialized" -> buildJsonObject { } // 通知，无需响应
                 "tools/list" -> listTools()
                 "tools/call" -> callTool(params)
                 "resources/list" -> listResources()
                 "resources/read" -> readResource(params)
                 "ping" -> buildJsonObject { put("pong", true) }
+                "server/discover" -> buildJsonObject {
+                    // 某些 MCP 客户端（如 Claude Desktop 的某些版本）发送 server/discover 做服务发现
+                    // 返回服务器能力描述，与 initialize 类似但更简洁
+                    put("serverInfo", buildJsonObject {
+                        put("name", "DayTrace MCP Server")
+                        put("version", "0.1.0")
+                    })
+                    put("capabilities", buildJsonObject {
+                        put("tools", buildJsonObject { put("listChanged", true) })
+                        put("resources", buildJsonObject { put("listChanged", true) })
+                    })
+                    put("protocolVersion", PROTOCOL_VERSION)
+                }
                 else -> {
                     val resp = errorResponse(-32601, "Method not found: $method", id)
                     logRecorder.log(
@@ -675,7 +717,8 @@ private fun getClientIp(session: IHTTPSession): String {
         }
 
         // 通知（id 为 null 的请求）不需要返回结果
-        if (id == null && method == "initialized") {
+        // MCP 规范中通知方法名带 'notifications/' 前缀
+        if (id == null && (method == "initialized" || method == "notifications/initialized")) {
             val resp = newFixedLengthResponse(Response.Status.OK, "application/json", "{}")
             addCorsHeaders(resp)
             if (sessionId.isNotEmpty()) resp.addHeader(SESSION_HEADER, sessionId)
@@ -774,11 +817,23 @@ private fun getClientIp(session: IHTTPSession): String {
                 val result = try {
                     when (method) {
                         "initialize" -> initializeResult()
+                        "initialized", "notifications/initialized" -> buildJsonObject { }
                         "tools/list" -> listTools()
                         "tools/call" -> callTool(params)
                         "resources/list" -> listResources()
                         "resources/read" -> readResource(params)
                         "ping" -> buildJsonObject { put("pong", true) }
+                        "server/discover" -> buildJsonObject {
+                            put("serverInfo", buildJsonObject {
+                                put("name", "DayTrace MCP Server")
+                                put("version", "0.1.0")
+                            })
+                            put("capabilities", buildJsonObject {
+                                put("tools", buildJsonObject { put("listChanged", true) })
+                                put("resources", buildJsonObject { put("listChanged", true) })
+                            })
+                            put("protocolVersion", PROTOCOL_VERSION)
+                        }
                         else -> buildJsonObject {
                             put("code", -32601)
                             put("message", "Method not found: $method")
@@ -821,7 +876,7 @@ private fun getClientIp(session: IHTTPSession): String {
     /** 构建 SSE 格式响应 */
     private fun sseResponse(jsonRpcResponse: String, sessionId: String): Response {
         val sseData = "data: $jsonRpcResponse\n\n"
-        val stream = java.io.ByteArrayInputStream(sseData.toByteArray())
+        val stream = java.io.ByteArrayInputStream(sseData.toByteArray(Charsets.UTF_8))
         val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", stream)
         resp.addHeader("Cache-Control", "no-cache")
         resp.addHeader("Connection", "keep-alive")
@@ -989,13 +1044,157 @@ private fun getClientIp(session: IHTTPSession): String {
                 description = "Delete a captured file by its filename.",
                 properties = buildJsonObject {
                     put("filename", propObj("string", "Filename to delete (e.g. photo_2026-08-24_14-30-00-000.jpg)", ""))
-                    put("category", propObj("string", "Category: 'photos', 'videos', or 'audio'", "photos"))
+                    put("category", propObj("string", "Category: 'photos', 'videos', 'audio', or 'screenshots'", "photos"))
                 },
                 required = listOf("filename")
             ))
             add(toolJson(
                 name = "grant_camera_mic_permissions",
                 description = "Attempt to grant CAMERA and RECORD_AUDIO permissions via Shizuku (shell-level pm grant). Requires Shizuku running and authorized."
+            ))
+            add(toolJson(
+                name = "take_screenshot",
+                description = "Capture a screenshot of the current phone screen. Returns base64-encoded image data (PNG or JPEG) and screen metadata. Requires Shizuku running and authorized.",
+                properties = buildJsonObject {
+                    put("format", propObj("string", "Image format: 'png' (default, lossless) or 'jpeg' (compressed, smaller size)", "png"))
+                    put("quality", propObj("integer", "JPEG quality (1-100, default 80). Only used when format=jpeg", 80))
+                    put("returnBase64", propObj("boolean", "If true (default), return image as base64 data. If false, only return download URL", true))
+                }
+            ))
+            add(toolJson(
+                name = "get_screen_text",
+                description = "Extract all visible text from the current phone screen. Uses the accessibility service to traverse the view hierarchy and collect text from all nodes, sorted top-to-bottom by Y position. Requires the accessibility service to be enabled.",
+                properties = buildJsonObject {
+                    put("includeBounds", propObj("boolean", "If true, include bounding box coordinates for each text element (default false)", false))
+                }
+            ))
+            // === 设备信息 (3) ===
+            add(toolJson(
+                name = "get_device_info",
+                description = "Get comprehensive device information: model, Android version, battery level/charging state, memory/storage usage, screen resolution, and network status."
+            ))
+            add(toolJson(
+                name = "get_app_usage_stats",
+                description = "Get today's app usage statistics (foreground time per app, sorted by duration). Requires PACKAGE_USAGE_STATS permission or Shizuku."
+            ))
+            add(toolJson(
+                name = "get_installed_apps",
+                description = "List all installed apps on the device with package name, app name, version, and whether it's a system app.",
+                properties = buildJsonObject {
+                    put("includeSystem", propObj("boolean", "Include system apps in the list (default false)", false))
+                }
+            ))
+            // === 电池 (1) ===
+            add(toolJson(
+                name = "get_battery_history",
+                description = "Get detailed battery information: level, charging status, health, temperature, voltage, technology, and battery service dump via Shizuku."
+            ))
+            // === 剪贴板 (2) ===
+            add(toolJson(
+                name = "get_clipboard",
+                description = "Read the current content of the system clipboard."
+            ))
+            add(toolJson(
+                name = "set_clipboard",
+                description = "Write text to the system clipboard.",
+                properties = buildJsonObject {
+                    put("text", propObj("string", "Text to set on the clipboard", ""))
+                },
+                required = listOf("text")
+            ))
+            // === 通知 (2) ===
+            add(toolJson(
+                name = "send_notification",
+                description = "Send a local notification to the phone (e.g. for AI to remind the user).",
+                properties = buildJsonObject {
+                    put("title", propObj("string", "Notification title", ""))
+                    put("message", propObj("string", "Notification body text", ""))
+                    put("priority", propObj("string", "Priority: 'low', 'default', or 'high'", "default"))
+                },
+                required = listOf("title", "message")
+            ))
+            add(toolJson(
+                name = "get_notification_log",
+                description = "Get recent notification history (captured by the notification listener service, in-memory cache of last 100).",
+                properties = buildJsonObject {
+                    put("limit", propObj("integer", "Max notifications to return (default 50, max 100)", 50))
+                }
+            ))
+            // === 短信 (1) ===
+            add(toolJson(
+                name = "send_text_message",
+                description = "Send an SMS message to a phone number. Requires SEND_SMS permission (via Shizuku pm grant) or Shizuku shell.",
+                properties = buildJsonObject {
+                    put("phoneNumber", propObj("string", "Recipient phone number", ""))
+                    put("message", propObj("string", "SMS message content", ""))
+                },
+                required = listOf("phoneNumber", "message")
+            ))
+            // === 屏幕操作 (3) ===
+            add(toolJson(
+                name = "take_screenshot_region",
+                description = "Capture a screenshot of a specific region of the screen. Takes a full screenshot first, then crops to the specified bounds. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("left", propObj("integer", "Left boundary (pixels)", 0))
+                    put("top", propObj("integer", "Top boundary (pixels)", 0))
+                    put("right", propObj("integer", "Right boundary (pixels)", 0))
+                    put("bottom", propObj("integer", "Bottom boundary (pixels)", 0))
+                    put("format", propObj("string", "Image format: 'png' (default) or 'jpeg'", "png"))
+                    put("quality", propObj("integer", "JPEG quality 1-100 (default 80)", 80))
+                },
+                required = listOf("left", "top", "right", "bottom")
+            ))
+            add(toolJson(
+                name = "get_screen_interactive_elements",
+                description = "Extract all interactive elements (buttons, input fields, toggles, etc.) from the current screen with their coordinates. Useful for AI to know where to tap. Requires accessibility service."
+            ))
+            add(toolJson(
+                name = "tap_screen",
+                description = "Simulate a tap at the specified screen coordinates. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("x", propObj("integer", "X coordinate (pixels)", 0))
+                    put("y", propObj("integer", "Y coordinate (pixels)", 0))
+                },
+                required = listOf("x", "y")
+            ))
+            // === UI 操作 (3) ===
+            add(toolJson(
+                name = "input_text",
+                description = "Type text into the currently focused input field. ASCII text uses 'input text' command; non-ASCII (e.g. Chinese) uses clipboard paste. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("text", propObj("string", "Text to type into the focused field", ""))
+                },
+                required = listOf("text")
+            ))
+            add(toolJson(
+                name = "press_key",
+                description = "Simulate a key press (Home, Back, Recent, Volume, etc.). Requires Shizuku. Available keys: home, back, recent, menu, power, volume_up, volume_down, volume_mute, delete, enter, escape, tab, space, search, camera, call, end_call, notification, screenshot.",
+                properties = buildJsonObject {
+                    put("key", propObj("string", "Key name (e.g. 'home', 'back') or keycode number", ""))
+                },
+                required = listOf("key")
+            ))
+            add(toolJson(
+                name = "swipe",
+                description = "Simulate a swipe gesture from one point to another. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("startX", propObj("integer", "Start X coordinate", 0))
+                    put("startY", propObj("integer", "Start Y coordinate", 0))
+                    put("endX", propObj("integer", "End X coordinate", 0))
+                    put("endY", propObj("integer", "End Y coordinate", 0))
+                    put("durationMs", propObj("integer", "Swipe duration in milliseconds (default 300)", 300))
+                },
+                required = listOf("startX", "startY", "endX", "endY")
+            ))
+            // === App 操作 (1) ===
+            add(toolJson(
+                name = "open_app",
+                description = "Open/launch an app by its package name. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("packageName", propObj("string", "App package name (e.g. com.tencent.mm)", ""))
+                    put("activity", propObj("string", "Optional specific activity to launch (e.g. .ui.LauncherUI)", ""))
+                },
+                required = listOf("packageName")
             ))
         }
 
@@ -1391,7 +1590,7 @@ private fun getClientIp(session: IHTTPSession): String {
                 val capturesDir = context.getExternalFilesDir("captures")!!
                 buildString {
                     appendLine("=== Captured Files ===")
-                    for (category in listOf("photos", "videos", "audio")) {
+                    for (category in listOf("photos", "videos", "audio", "screenshots")) {
                         val dir = File(capturesDir, category)
                         val files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
                         appendLine()
@@ -1442,6 +1641,224 @@ private fun getClientIp(session: IHTTPSession): String {
                 } else {
                     "Error: ${result.exceptionOrNull()?.message}"
                 }
+            }
+
+            "take_screenshot" -> {
+                val format = args["format"]?.jsonPrimitive?.contentOrNull ?: "png"
+                val quality = args["quality"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 100) ?: 80
+                val returnBase64 = args["returnBase64"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: true
+
+                // 检查 Shizuku 权限
+                if (!com.daytrace.util.ShizukuHelper.hasPermission()) {
+                    "Error: Shizuku permission not granted. Start Shizuku and authorize DayTrace first."
+                } else {
+                    val result = screenManager.takeScreenshot(format, quality)
+                    if (result != null) {
+                        val base64 = if (returnBase64) screenManager.encodeFileBase64(result.file) else null
+                        buildString {
+                            appendLine("=== Screenshot Captured ===")
+                            appendLine("Format: ${result.format}")
+                            appendLine("Resolution: ${result.width}x${result.height}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Foreground app: ${result.foregroundPackage}")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/screenshots/${result.file.name}")
+                            if (returnBase64 && base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(Use download URL or set returnBase64=true for inline data)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to capture screenshot. Check Shizuku permissions and availability."
+                    }
+                }
+            }
+
+            "get_screen_text" -> {
+                // 检查无障碍服务是否运行
+                if (!com.daytrace.service.CaptureAccessibilityService.isRunning) {
+                    "Error: Accessibility service not running. Enable it in Android Settings or via Shizuku."
+                } else {
+                    val result = screenManager.getScreenText()
+                    if (result != null) {
+                        buildString {
+                            appendLine("=== Screen Text ===")
+                            appendLine("Foreground app: ${result.foregroundPackage}")
+                            appendLine("Text nodes: ${result.nodeCount}")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine()
+                            appendLine(result.text)
+                        }
+                    } else {
+                        "Error: Failed to extract screen text. Accessibility service may not have focus."
+                    }
+                }
+            }
+
+            // === 设备信息 ===
+
+            "get_device_info" -> {
+                deviceInfoManager.getDeviceInfo()
+            }
+
+            "get_app_usage_stats" -> {
+                deviceInfoManager.getAppUsageStats()
+            }
+
+            "get_installed_apps" -> {
+                val includeSystem = args["includeSystem"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+                deviceInfoManager.getInstalledApps(includeSystem)
+            }
+
+            // === 电池 ===
+
+            "get_battery_history" -> {
+                deviceInfoManager.getBatteryHistory()
+            }
+
+            // === 剪贴板 ===
+
+            "get_clipboard" -> {
+                deviceInfoManager.getClipboard()
+            }
+
+            "set_clipboard" -> {
+                val text = args["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (text.isBlank()) "Error: text is required"
+                else deviceInfoManager.setClipboard(text)
+            }
+
+            // === 通知 ===
+
+            "send_notification" -> {
+                val title = args["title"]?.jsonPrimitive?.contentOrNull ?: ""
+                val message = args["message"]?.jsonPrimitive?.contentOrNull ?: ""
+                val priority = args["priority"]?.jsonPrimitive?.contentOrNull ?: "default"
+                if (title.isBlank() || message.isBlank()) {
+                    "Error: title and message are required"
+                } else {
+                    deviceInfoManager.sendNotification(title, message, priority)
+                }
+            }
+
+            "get_notification_log" -> {
+                val limit = args["limit"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 100) ?: 50
+                val records = com.daytrace.service.NotificationCaptureService.getNotificationHistory(limit)
+                if (records.isEmpty()) {
+                    "No notification history captured yet."
+                } else {
+                    val df = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA)
+                    buildString {
+                        appendLine("=== Notification History (${records.size} of last ${minOf(limit, 100)}) ===")
+                        records.forEach { r ->
+                            val type = if (r.chatType == 2) "[群]" else "[私]"
+                            append("[${df.format(Date(r.timestamp))}] ${r.appName} $type")
+                            if (r.sender.isNotEmpty()) append(" ${r.sender}")
+                            append("\n  ${r.text.take(200)}")
+                            append("\n  (${r.packageName})\n\n")
+                        }
+                    }
+                }
+            }
+
+            // === 短信 ===
+
+            "send_text_message" -> {
+                val phoneNumber = args["phoneNumber"]?.jsonPrimitive?.contentOrNull ?: ""
+                val message = args["message"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (phoneNumber.isBlank() || message.isBlank()) {
+                    "Error: phoneNumber and message are required"
+                } else {
+                    deviceInfoManager.sendTextMessage(phoneNumber, message)
+                }
+            }
+
+            // === 屏幕操作 ===
+
+            "take_screenshot_region" -> {
+                val left = args["left"]?.jsonPrimitive?.intOrNull ?: 0
+                val top = args["top"]?.jsonPrimitive?.intOrNull ?: 0
+                val right = args["right"]?.jsonPrimitive?.intOrNull ?: 0
+                val bottom = args["bottom"]?.jsonPrimitive?.intOrNull ?: 0
+                val format = args["format"]?.jsonPrimitive?.contentOrNull ?: "png"
+                val quality = args["quality"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 100) ?: 80
+
+                if (!com.daytrace.util.ShizukuHelper.hasPermission()) {
+                    "Error: Shizuku permission not granted."
+                } else {
+                    val result = screenManager.takeScreenshotRegion(left, top, right, bottom, format, quality)
+                    if (result != null) {
+                        val base64 = screenManager.encodeFileBase64(result.file)
+                        buildString {
+                            appendLine("=== Screenshot Region Captured ===")
+                            appendLine("Bounds: ($left,$top)-($right,$bottom)")
+                            appendLine("Cropped size: ${result.width}x${result.height}")
+                            appendLine("Format: ${result.format}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Foreground app: ${result.foregroundPackage}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/screenshots/${result.file.name}")
+                            if (base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(base64 encoding failed, use download URL)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to capture screenshot region. Check bounds and Shizuku permissions."
+                    }
+                }
+            }
+
+            "get_screen_interactive_elements" -> {
+                if (!com.daytrace.service.CaptureAccessibilityService.isRunning) {
+                    "Error: Accessibility service not running. Enable it in Android Settings or via Shizuku."
+                } else {
+                    actionManager.getScreenInteractiveElements()
+                        ?: "Error: Failed to get interactive elements. Accessibility service may not have focus."
+                }
+            }
+
+            "tap_screen" -> {
+                val x = args["x"]?.jsonPrimitive?.intOrNull ?: -1
+                val y = args["y"]?.jsonPrimitive?.intOrNull ?: -1
+                actionManager.tapScreen(x, y)
+            }
+
+            // === UI 操作 ===
+
+            "input_text" -> {
+                val text = args["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (text.isBlank()) "Error: text is required"
+                else actionManager.inputText(text)
+            }
+
+            "press_key" -> {
+                val key = args["key"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (key.isBlank()) "Error: key is required"
+                else actionManager.pressKey(key)
+            }
+
+            "swipe" -> {
+                val startX = args["startX"]?.jsonPrimitive?.intOrNull ?: 0
+                val startY = args["startY"]?.jsonPrimitive?.intOrNull ?: 0
+                val endX = args["endX"]?.jsonPrimitive?.intOrNull ?: 0
+                val endY = args["endY"]?.jsonPrimitive?.intOrNull ?: 0
+                val durationMs = args["durationMs"]?.jsonPrimitive?.intOrNull?.coerceIn(50, 5000) ?: 300
+                actionManager.swipe(startX, startY, endX, endY, durationMs)
+            }
+
+            // === App 操作 ===
+
+            "open_app" -> {
+                val packageName = args["packageName"]?.jsonPrimitive?.contentOrNull ?: ""
+                val activity = args["activity"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (packageName.isBlank()) "Error: packageName is required"
+                else actionManager.openApp(packageName, activity)
             }
 
             else -> "Unknown tool: $name"
@@ -1555,7 +1972,7 @@ private fun getClientIp(session: IHTTPSession): String {
         val filename = File(parts[1]).name  // 防止路径遍历
 
         // 验证 category
-        if (category !in listOf("photos", "videos", "audio")) {
+        if (category !in listOf("photos", "videos", "audio", "screenshots")) {
             val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Invalid category: $category")
             addCorsHeaders(resp)
             logRecorder.log(
@@ -1584,8 +2001,8 @@ private fun getClientIp(session: IHTTPSession): String {
 
         // 确定 MIME type
         val mimeType = when {
-            filename.endsWith(".jpg", true) || filename.endsWith(".jpeg", true) -> "image/jpeg"
             filename.endsWith(".png", true) -> "image/png"
+            filename.endsWith(".jpg", true) || filename.endsWith(".jpeg", true) -> "image/jpeg"
             filename.endsWith(".mp4", true) -> "video/mp4"
             filename.endsWith(".m4a", true) || filename.endsWith(".aac", true) -> "audio/mp4"
             filename.endsWith(".wav", true) -> "audio/wav"

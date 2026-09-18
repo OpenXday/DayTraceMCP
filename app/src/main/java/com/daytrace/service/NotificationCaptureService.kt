@@ -27,6 +27,16 @@ class NotificationCaptureService : NotificationListenerService() {
         @Volatile var isRunning = false
             private set
 
+        /** 最近通知历史（内存缓存，最多 100 条） */
+        private val notificationHistory = ArrayDeque<NotificationRecord>(100)
+
+        /** 获取最近通知历史 */
+        fun getNotificationHistory(limit: Int = 50): List<NotificationRecord> {
+            return synchronized(notificationHistory) {
+                notificationHistory.toList().takeLast(limit).reversed()
+            }
+        }
+
         /** 已知IM/AI 应用包名 */
         private val IM_PACKAGES = setOf(
             // 传统IM
@@ -349,5 +359,31 @@ class NotificationCaptureService : NotificationListenerService() {
                 Log.e(TAG, "save failed: ${e.message}")
             }
         }
+
+        // 记录到通知历史
+        val record = NotificationRecord(
+            timestamp = System.currentTimeMillis(),
+            packageName = packageName,
+            appName = appName,
+            sender = sender,
+            text = cleanText,
+            chatType = chatType
+        )
+        synchronized(notificationHistory) {
+            notificationHistory.addLast(record)
+            while (notificationHistory.size > 100) notificationHistory.removeFirst()
+        }
     }
 }
+
+/**
+ * 通知历史记录（内存缓存，用于 MCP 查询）
+ */
+data class NotificationRecord(
+    val timestamp: Long,
+    val packageName: String,
+    val appName: String,
+    val sender: String,
+    val text: String,
+    val chatType: Int
+)
