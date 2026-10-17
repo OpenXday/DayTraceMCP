@@ -83,8 +83,8 @@ object ShizukuHelper {
                 }
             }
 
-            val output = process.inputStream.bufferedReader().readText()
-            val error = process.errorStream.bufferedReader().readText()
+            val output = process.inputStream.bufferedReader(Charsets.UTF_8).readText()
+            val error = process.errorStream.bufferedReader(Charsets.UTF_8).readText()
             val exitCode = process.waitFor()
 
             Log.d(TAG, "execShell result: exit=$exitCode, out=${output.take(200)}, err=${error.take(200)}")
@@ -264,23 +264,138 @@ object ShizukuHelper {
         }
     }
 
-    /** 检查无障碍服务是否已启用 */
+    /**
+     * 检查无障碍服务是否已启用
+     *
+     * 多重检测策略（按可靠性排序）：
+     * 1. 静态标志位 isRunning：服务进程内直接标记，最准确反映服务实际运行状态
+     * 2. Settings.Secure 字符串检查：作为 fallback，覆盖服务未启动但已配置的场景
+     *
+     * 背景：长时间运行后，Settings.Secure 中的 enabled_accessibility_services
+     * 可能与实际服务运行状态不同步（系统内部缓存偏差），导致"服务在跑但状态显示未开启"。
+     * 关闭再开启后恢复正常，因为重新写入触发了同步。
+     * 静态标志位不受此问题影响。
+     */
     fun isAccessibilityEnabled(context: Context, serviceClass: Class<*>): Boolean {
+        // 1. 优先检查服务进程内的静态标志位
+        if (serviceClass == com.daytrace.service.CaptureAccessibilityService::class.java) {
+            if (com.daytrace.service.CaptureAccessibilityService.isRunning) {
+                return true
+            }
+        }
+
+        // 2. Fallback: 检查 Settings.Secure 中的服务列表
         val expected = ComponentName(context, serviceClass).flattenToString()
         val enabled = Settings.Secure.getString(
             context.contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
-        return enabled.contains(expected)
+
+        val inSettings = enabled.contains(expected)
+
+        // 诊断日志：静态标志位为 false 但 Settings 中存在（可能服务刚被系统回收）
+        if (!inSettings) {
+            Log.w(TAG, "isAccessibilityEnabled: service not in Settings.Secure (expected=$expected, enabled=$enabled)")
+        }
+
+        return inSettings
     }
 
-    /** 检查通知监听是否已启用 */
+    /**
+     * 检查通知监听是否已启用
+     *
+     * 同无障碍服务，采用双重检测：
+     * 1. 静态标志位 isRunning：最准确反映服务实际运行状态
+     * 2. Settings.Secure 字符串检查：作为 fallback
+     */
     fun isNotificationListenerEnabled(context: Context): Boolean {
+        // 1. 优先检查服务进程内的静态标志位
+        if (com.daytrace.service.NotificationCaptureService.isRunning) {
+            return true
+        }
+
+        // 2. Fallback: 检查 Settings.Secure 中的服务列表
         val flat = ComponentName(context, com.daytrace.service.NotificationCaptureService::class.java).flattenToString()
         val enabled = Settings.Secure.getString(
             context.contentResolver,
             "enabled_notification_listeners"
         ) ?: return false
-        return enabled.contains(flat)
+
+        val inSettings = enabled.contains(flat)
+
+        if (!inSettings) {
+            Log.w(TAG, "isNotificationListenerEnabled: service not in Settings.Secure (expected=$flat, enabled=$enabled)")
+        }
+
+        return inSettings
+    }
+
+    // === 运行时权限（相机/录音）===
+
+    /**
+     * 通过 Shizuku shell 授予运行时权限（dangerous permissions）
+     *
+     * 使用 `pm grant <package> <permission>` 命令，以 shell 身份执行。
+     * shell 用户有权限直接授予 dangerous permissions，无需用户弹窗确认。
+     *
+     * @param context Context
+     * @param permissions 要授予的权限列表（如 android.permission.CAMERA）
+     * @return Result<Unit> 成功或失败
+     */
+    fun grantRuntimePermissions(context: Context, permissions: List<String>): Result<Unit> {
+        if (!hasPermission()) {
+            return Result.failure(IllegalStateException("Shizuku permission not granted"))
+        }
+
+        val pkg = context.packageName
+        var allSuccess = true
+        val failedPerms = mutableListOf<String>()
+
+        for (perm in permissions) {
+            // 先检查是否已授权
+            val granted = context.checkSelfPermission(perm) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                Log.d(TAG, "grantRuntimePermissions: $perm already granted")
+                continue
+            }
+
+            val cmd = "pm grant $pkg $perm"
+            Log.i(TAG, "grantRuntimePermissions: $cmd")
+            val result = execShell(cmd)
+            if (result.isFailure) {
+                Log.e(TAG, "grantRuntimePermissions: failed for $perm: ${result.exceptionOrNull()?.message}")
+                allSuccess = false
+                failedPerms.add(perm)
+            } else {
+                Log.i(TAG, "grantRuntimePermissions: $perm granted successfully")
+            }
+        }
+
+        return if (allSuccess) {
+            Result.success(Unit)
+        } else {
+            Result.failure(RuntimeException("Failed to grant: ${failedPerms.joinToString(", ")}"))
+        }
+    }
+
+    /** 授予相机和录音权限 */
+    fun grantCameraAndMicPermissions(context: Context): Result<Unit> {
+        return grantRuntimePermissions(context, listOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO
+        ))
+    }
+
+    /** 检查相机权限是否已授予 */
+    fun isCameraGranted(context: Context): Boolean {
+        return context.checkSelfPermission(android.Manifest.permission.CAMERA) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    /** 检查录音权限是否已授予 */
+    fun isMicGranted(context: Context): Boolean {
+        return context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
     }
 }

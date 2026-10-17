@@ -287,7 +287,7 @@ object CloudflareTunnelManager {
             }.toString()
             // 写入 App 可写目录，再通过 Shizuku cp 到 /data/local/tmp/
             val tmpCredFile = java.io.File(ctx.getExternalFilesDir(null), "daytrace_cred.json")
-            FileOutputStream(tmpCredFile).use { it.write(credJson.toByteArray()) }
+            FileOutputStream(tmpCredFile).use { it.write(credJson.toByteArray(Charsets.UTF_8)) }
             ShizukuHelper.execShell("cp '${tmpCredFile.absolutePath}' '$SHELL_CRED_PATH' && chmod 644 '$SHELL_CRED_PATH'")
             Log.i(TAG, "Credentials file written to $SHELL_CRED_PATH")
 
@@ -302,7 +302,7 @@ object CloudflareTunnelManager {
                 append("no-autoupdate: true\n")
             }
             val tmpConfigFile = java.io.File(ctx.getExternalFilesDir(null), "daytrace_config.yml")
-            FileOutputStream(tmpConfigFile).use { it.write(yamlConfig.toByteArray()) }
+            FileOutputStream(tmpConfigFile).use { it.write(yamlConfig.toByteArray(Charsets.UTF_8)) }
             ShizukuHelper.execShell("cp '${tmpConfigFile.absolutePath}' '$SHELL_CONFIG_PATH' && chmod 644 '$SHELL_CONFIG_PATH'")
             Log.i(TAG, "Config file written to $SHELL_CONFIG_PATH")
 

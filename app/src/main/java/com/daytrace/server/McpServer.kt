@@ -2,6 +2,7 @@ package com.daytrace.server
 
 import android.content.Context
 import android.util.Log
+import com.daytrace.data.McpLogEntry
 import com.daytrace.data.MessageEntry
 import com.daytrace.export.TimelineExporter
 import fi.iki.elonen.NanoHTTPD
@@ -19,6 +20,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.add
+import android.util.Base64
+import java.io.File
+import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,6 +41,8 @@ import java.util.concurrent.ConcurrentHashMap
  *   DELETE /mcp        (终止会话)
  *   GET    /           (健康检查)
  *   GET    /mcp/tools  (工具列表，便利端点)
+ *
+ * 所有 MCP 调用均通过 [logRecorder] 异步写入 mcp_logs 表，可在 App 内审计。
  */
 class McpServer(
     private val context: Context,
@@ -65,6 +71,36 @@ class McpServer(
         (context.applicationContext as com.daytrace.DayTraceApp).database.messageDao()
     }
 
+    /** MCP 调用日志记录器（异步写入数据库，不阻塞请求处理） */
+    private val logRecorder by lazy {
+        McpLogRecorder(context)
+    }
+
+    /** 相机拍照/录像管理器 */
+    private val cameraManager by lazy {
+        CameraCaptureManager(context.applicationContext)
+    }
+
+    /** 录音管理器 */
+    private val audioManager by lazy {
+        AudioCaptureManager(context.applicationContext)
+    }
+
+    /** 屏幕截图/文字提取管理器 */
+    private val screenManager by lazy {
+        ScreenCaptureManager(context.applicationContext)
+    }
+
+    /** 设备信息管理器 */
+    private val deviceInfoManager by lazy {
+        DeviceInfoManager(context.applicationContext)
+    }
+
+    /** 系统操作管理器 */
+    private val actionManager by lazy {
+        SystemActionManager(context.applicationContext)
+    }
+
     fun startServer() {
         try {
             start(SOCKET_READ_TIMEOUT, false)
@@ -85,13 +121,46 @@ class McpServer(
 
     fun getPort(): Int = getListeningPort()
 
+/**
+ * 提取客户端真实 IP
+ *
+ * 当请求通过 Cloudflare Tunnel 或反向代理到达时，NanoHTTPD 的
+ * remote-addr 会是 127.0.0.1（隧道本地回环）。此时需要从代理
+ * 转发的 header 中提取真实客户端 IP。
+ *
+ * 优先级（从高到低）：
+ * 1. CF-Connecting-IP — Cloudflare 隧道直接写入的真实 IP（单个，无逗号）
+ * 2. X-Real-IP — Nginx 等反向代理设置的真实 IP
+ * 3. X-Forwarded-For — 标准代理 header，可能含多个 IP（第一个是原始客户端）
+ * 4. remote-addr — NanoHTTPD 的直接连接 IP（无代理时为真实客户端）
+ * 5. unknown — 兜底
+ */
+private fun getClientIp(session: IHTTPSession): String {
+    // Cloudflare 隧道直接写入的客户端真实 IP
+    session.headers["cf-connecting-ip"]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    // X-Real-IP（Nginx 等设置）
+    session.headers["x-real-ip"]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    // X-Forwarded-For（可能逗号分隔，取第一个）
+    session.headers["x-forwarded-for"]
+        ?.split(",")
+        ?.firstOrNull()
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { return it }
+    // 直接连接 IP（无代理场景）
+    session.headers["remote-addr"]?.takeIf { it.isNotEmpty() }?.let { return it }
+    return "unknown"
+}
+
     // === NanoHTTPD HTTP handler ===
 
     override fun serve(session: IHTTPSession): Response {
+        val requestStartTime = System.currentTimeMillis()
         val uri = session.uri
         val method = session.method
+        val clientIp = getClientIp(session)
 
-        // CORS preflight
+        // CORS preflight（不记录日志）
         if (method == Method.OPTIONS) {
             val resp = newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "")
             addCorsHeaders(resp)
@@ -100,9 +169,11 @@ class McpServer(
 
         // 安全认证：如果启用了 Token，校验 Authorization header
         val authEnabled = com.daytrace.util.Prefs.isMcpAuthEnabled(context)
+        var authResult = McpLogEntry.AUTH_NOT_REQUIRED
         if (authEnabled) {
             val expectedToken = com.daytrace.util.Prefs.getMcpToken(context)
             if (expectedToken.isNotEmpty()) {
+                authResult = McpLogEntry.AUTH_OK
                 val authHeader = session.headers["authorization"] ?: ""
                 val providedToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
                     authHeader.substring(7).trim()
@@ -112,6 +183,7 @@ class McpServer(
                     params["token"]?.firstOrNull() ?: ""
                 }
                 if (providedToken != expectedToken) {
+                    authResult = McpLogEntry.AUTH_FAILED
                     val resp = newFixedLengthResponse(
                         Response.Status.UNAUTHORIZED,
                         "application/json",
@@ -119,9 +191,28 @@ class McpServer(
                     )
                     resp.addHeader("WWW-Authenticate", "Bearer realm=\"DayTrace MCP\"")
                     addCorsHeaders(resp)
+                    // 记录认证失败日志
+                    logRecorder.log(
+                        httpMethod = method.name,
+                        httpPath = uri,
+                        clientIp = clientIp,
+                        responseCode = 401,
+                        durationMs = System.currentTimeMillis() - requestStartTime,
+                        rpcMethod = "",
+                        sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: "",
+                        authResult = authResult,
+                        requestBody = "",
+                        responseBody = """{"error":"Unauthorized","message":"Invalid or missing Bearer token"}""",
+                        success = false,
+                        errorMessage = "Authentication failed: invalid or missing Bearer token"
+                    )
                     return resp
                 }
+            } else {
+                authResult = McpLogEntry.AUTH_NOT_REQUIRED
             }
+        } else {
+            authResult = McpLogEntry.AUTH_NOT_REQUIRED
         }
 
         // Health check
@@ -133,23 +224,63 @@ class McpServer(
                 put("port", getListeningPort())
                 put("authRequired", authEnabled)
             }
-            return jsonResponse(health.toString())
+            val resp = jsonResponse(health.toString())
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = uri,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "health_check",
+                authResult = authResult,
+                responseBody = health.toString(),
+                success = true
+            )
+            return resp
         }
 
         // MCP Streamable HTTP transport endpoint
         if (uri == MCP_ENDPOINT) {
-            return handleMcpEndpoint(session, method)
+            return handleMcpEndpoint(session, method, clientIp, authResult, requestStartTime)
+        }
+
+        // 文件下载端点：/captures/photos/<filename>, /captures/videos/<filename>, /captures/audio/<filename>, /captures/screenshots/<filename>
+        if (uri.startsWith("/captures/") && method == Method.GET) {
+            return handleCaptureDownload(uri, clientIp, authResult, requestStartTime)
         }
 
         // OpenAPI-style discovery (convenience endpoint)
         if (uri == "/mcp/tools" && method == Method.GET) {
             val tools = listTools()
-            return jsonResponse(tools.toString())
+            val resp = jsonResponse(tools.toString())
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = uri,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "tools_list_endpoint",
+                authResult = authResult,
+                responseBody = tools.toString(),
+                success = true
+            )
+            return resp
         }
 
         // Legacy SSE info endpoint
         if (uri == "/mcp/sse" && method == Method.GET) {
-            return handleSseInfo()
+            val resp = handleSseInfo()
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = uri,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "sse_info",
+                authResult = authResult,
+                success = true
+            )
+            return resp
         }
 
         // 405 for unsupported methods on known paths, 404 for unknown paths
@@ -159,6 +290,18 @@ class McpServer(
             newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found: $uri")
         }
         addCorsHeaders(resp)
+        val respCode = if (uri.startsWith("/mcp")) 405 else 404
+        logRecorder.log(
+            httpMethod = method.name,
+            httpPath = uri,
+            clientIp = clientIp,
+            responseCode = respCode,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "",
+            authResult = authResult,
+            success = false,
+            errorMessage = if (respCode == 405) "Method not allowed" else "Not found"
+        )
         return resp
     }
 
@@ -169,11 +312,17 @@ class McpServer(
      * GET    /mcp — SSE 流（服务器推送事件）
      * DELETE /mcp — 终止会话
      */
-    private fun handleMcpEndpoint(session: IHTTPSession, method: Method): Response {
+    private fun handleMcpEndpoint(
+        session: IHTTPSession,
+        method: Method,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         return when (method) {
-            Method.POST -> handleRpc(session)
-            Method.GET -> handleSseStream(session)
-            Method.DELETE -> handleDeleteSession(session)
+            Method.POST -> handleRpc(session, clientIp, authResult, requestStartTime)
+            Method.GET -> handleSseStream(session, clientIp, authResult, requestStartTime)
+            Method.DELETE -> handleDeleteSession(session, clientIp, authResult, requestStartTime)
             else -> {
                 val resp = newFixedLengthResponse(
                     Response.Status.METHOD_NOT_ALLOWED,
@@ -181,13 +330,29 @@ class McpServer(
                     """{"error":"Method not allowed","message":"Use POST, GET, or DELETE on /mcp"}"""
                 )
                 addCorsHeaders(resp)
+                logRecorder.log(
+                    httpMethod = method.name,
+                    httpPath = MCP_ENDPOINT,
+                    clientIp = clientIp,
+                    responseCode = 405,
+                    durationMs = System.currentTimeMillis() - requestStartTime,
+                    rpcMethod = "",
+                    authResult = authResult,
+                    success = false,
+                    errorMessage = "Method not allowed on /mcp"
+                )
                 resp
             }
         }
     }
 
     /** 处理 DELETE /mcp — 终止会话 */
-    private fun handleDeleteSession(session: IHTTPSession): Response {
+    private fun handleDeleteSession(
+        session: IHTTPSession,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
         if (sessionId.isNotEmpty()) {
             sessions.remove(sessionId)
@@ -195,6 +360,18 @@ class McpServer(
         }
         val resp = newFixedLengthResponse(Response.Status.OK, "application/json", "{}")
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "DELETE",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "session_delete",
+            sessionId = sessionId,
+            authResult = authResult,
+            success = true
+        )
         return resp
     }
 
@@ -205,7 +382,12 @@ class McpServer(
      * 我们返回一个简单的 SSE 流，保持连接并定期发送 ping。
      * 如果客户端没有有效会话，返回 400。
      */
-    private fun handleSseStream(session: IHTTPSession): Response {
+    private fun handleSseStream(
+        session: IHTTPSession,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
         val acceptHeader = session.headers["accept"] ?: ""
 
@@ -217,7 +399,20 @@ class McpServer(
                 put("note", "Use HTTP POST /mcp for JSON-RPC 2.0")
                 put("discovery", "GET /mcp/tools for tool list")
             }
-            return jsonResponse(info.toString())
+            val resp = jsonResponse(info.toString())
+            logRecorder.log(
+                httpMethod = "GET",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "sse_info",
+                sessionId = sessionId,
+                authResult = authResult,
+                responseBody = info.toString(),
+                success = true
+            )
+            return resp
         }
 
         // 返回 SSE 流
@@ -256,6 +451,18 @@ class McpServer(
         resp.addHeader("Connection", "keep-alive")
         resp.addHeader("X-Accel-Buffering", "no")
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "GET",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "sse_stream",
+            sessionId = sessionId,
+            authResult = authResult,
+            success = true
+        )
         return resp
     }
 
@@ -282,18 +489,64 @@ class McpServer(
         return jsonResponse(info.toString())
     }
 
-    private fun handleRpc(session: IHTTPSession): Response {
+    private fun handleRpc(
+        session: IHTTPSession,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val body = try {
-            val files = HashMap<String, String>()
-            session.parseBody(files)
-            files["postData"] ?: ""
+            // 不使用 NanoHTTPD 的 parseBody（它用 US-ASCII 解码 postData，导致中文丢失），
+            // 而是直接从 InputStream 读取原始字节，用 UTF-8 解码。
+            // 在 serve() 被调用时，inputStream 的位置已经在 header 之后（body 开始处）。
+            val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
+            if (contentLength > 0) {
+                val rawBytes = ByteArray(contentLength)
+                val inputStream = session.inputStream
+                var offset = 0
+                while (offset < contentLength) {
+                    val read = inputStream.read(rawBytes, offset, contentLength - offset)
+                    if (read < 0) break
+                    offset += read
+                }
+                String(rawBytes, 0, offset, Charsets.UTF_8)
+            } else {
+                ""
+            }
         } catch (e: Exception) {
-            return errorResponse(-32700, "Parse error: ${e.message}", null)
+            val resp = errorResponse(-32700, "Parse error: ${e.message}", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "",
+                authResult = authResult,
+                requestBody = "",
+                success = false,
+                errorMessage = "Parse error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
 
         // 空请求体可能是批量请求或 SSE 初始化
         if (body.isBlank()) {
-            return errorResponse(-32700, "Parse error: empty request body", null)
+            val resp = errorResponse(-32700, "Parse error: empty request body", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "",
+                authResult = authResult,
+                requestBody = "",
+                success = false,
+                errorMessage = "Parse error: empty request body"
+            )
+            return resp
         }
 
         // 检查是否是批量请求（JSON 数组）
@@ -303,13 +556,27 @@ class McpServer(
         val wantsSse = acceptHeader.contains("text/event-stream")
 
         if (isBatchRequest) {
-            return handleBatchRpc(body, session, wantsSse)
+            return handleBatchRpc(body, session, wantsSse, clientIp, authResult, requestStartTime)
         }
 
         val request = try {
             json.parseToJsonElement(body).jsonObject
         } catch (e: Exception) {
-            return errorResponse(-32700, "Parse error: ${e.message}", null)
+            val resp = errorResponse(-32700, "Parse error: ${e.message}", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "",
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Parse error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
 
         val id: JsonElement? = request["id"]
@@ -318,6 +585,11 @@ class McpServer(
 
         // 检查会话
         val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
+
+        // 用于日志的工具名提取
+        val toolName = if (method == "tools/call") {
+            params?.get("name")?.jsonPrimitive?.contentOrNull ?: ""
+        } else ""
 
         // initialize 请求需要创建新会话
         if (method == "initialize") {
@@ -340,6 +612,21 @@ class McpServer(
             }
             resp.addHeader(SESSION_HEADER, newSessId)
             addCorsHeaders(resp)
+
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "initialize",
+                rpcId = id?.toString() ?: "",
+                sessionId = newSessId,
+                authResult = authResult,
+                requestBody = body,
+                responseBody = response.toString(),
+                success = true
+            )
             return resp
         }
 
@@ -347,30 +634,106 @@ class McpServer(
         if (sessionId.isNotEmpty() && !sessions.containsKey(sessionId)) {
             val resp = errorResponse(-32000, "Invalid session: $sessionId", id)
             resp.addHeader(SESSION_HEADER, sessionId)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = method ?: "",
+                rpcId = id?.toString() ?: "",
+                toolName = toolName,
+                sessionId = sessionId,
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Invalid session: $sessionId"
+            )
             return resp
         }
 
         val result = try {
             when (method) {
                 "initialize" -> initializeResult()
-                "initialized" -> buildJsonObject { } // 通知，无需响应
+                "initialized", "notifications/initialized" -> buildJsonObject { } // 通知，无需响应
                 "tools/list" -> listTools()
                 "tools/call" -> callTool(params)
                 "resources/list" -> listResources()
                 "resources/read" -> readResource(params)
                 "ping" -> buildJsonObject { put("pong", true) }
-                else -> return errorResponse(-32601, "Method not found: $method", id)
+                "server/discover" -> buildJsonObject {
+                    // 某些 MCP 客户端（如 Claude Desktop 的某些版本）发送 server/discover 做服务发现
+                    // 返回服务器能力描述，与 initialize 类似但更简洁
+                    put("serverInfo", buildJsonObject {
+                        put("name", "DayTrace MCP Server")
+                        put("version", "0.1.0")
+                    })
+                    put("capabilities", buildJsonObject {
+                        put("tools", buildJsonObject { put("listChanged", true) })
+                        put("resources", buildJsonObject { put("listChanged", true) })
+                    })
+                    put("protocolVersion", PROTOCOL_VERSION)
+                }
+                else -> {
+                    val resp = errorResponse(-32601, "Method not found: $method", id)
+                    logRecorder.log(
+                        httpMethod = "POST",
+                        httpPath = MCP_ENDPOINT,
+                        clientIp = clientIp,
+                        responseCode = 200,
+                        durationMs = System.currentTimeMillis() - requestStartTime,
+                        rpcMethod = method ?: "",
+                        rpcId = id?.toString() ?: "",
+                        toolName = toolName,
+                        sessionId = sessionId,
+                        authResult = authResult,
+                        requestBody = body,
+                        success = false,
+                        errorMessage = "Method not found: $method"
+                    )
+                    return resp
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "RPC error: ${e.message}", e)
-            return errorResponse(-32603, "Internal error: ${e.message}", id)
+            val resp = errorResponse(-32603, "Internal error: ${e.message}", id)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = method ?: "",
+                rpcId = id?.toString() ?: "",
+                toolName = toolName,
+                sessionId = sessionId,
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Internal error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
 
         // 通知（id 为 null 的请求）不需要返回结果
-        if (id == null && method == "initialized") {
+        // MCP 规范中通知方法名带 'notifications/' 前缀
+        if (id == null && (method == "initialized" || method == "notifications/initialized")) {
             val resp = newFixedLengthResponse(Response.Status.OK, "application/json", "{}")
             addCorsHeaders(resp)
             if (sessionId.isNotEmpty()) resp.addHeader(SESSION_HEADER, sessionId)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = method ?: "",
+                sessionId = sessionId,
+                authResult = authResult,
+                requestBody = body,
+                success = true
+            )
             return resp
         }
 
@@ -389,16 +752,55 @@ class McpServer(
             resp.addHeader(SESSION_HEADER, sessionId)
         }
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "POST",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = method ?: "",
+            rpcId = id?.toString() ?: "",
+            toolName = toolName,
+            sessionId = sessionId,
+            authResult = authResult,
+            requestBody = body,
+            responseBody = response.toString(),
+            success = true
+        )
         return resp
     }
 
     /** 处理批量 JSON-RPC 请求 */
-    private fun handleBatchRpc(body: String, session: IHTTPSession, wantsSse: Boolean): Response {
+    private fun handleBatchRpc(
+        body: String,
+        session: IHTTPSession,
+        wantsSse: Boolean,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
         val requests = try {
             json.parseToJsonElement(body).jsonArray
         } catch (e: Exception) {
-            return errorResponse(-32700, "Parse error: ${e.message}", null)
+            val resp = errorResponse(-32700, "Parse error: ${e.message}", null)
+            logRecorder.log(
+                httpMethod = "POST",
+                httpPath = MCP_ENDPOINT,
+                clientIp = clientIp,
+                responseCode = 200,
+                durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "batch",
+                authResult = authResult,
+                requestBody = body,
+                success = false,
+                errorMessage = "Batch parse error: ${e.message}",
+                errorStack = e.stackTraceToString()
+            )
+            return resp
         }
+
+        val sessionId = session.headers[SESSION_HEADER.lowercase()] ?: session.headers[SESSION_HEADER] ?: ""
 
         val results = buildJsonArray {
             for (i in 0 until requests.size) {
@@ -415,11 +817,23 @@ class McpServer(
                 val result = try {
                     when (method) {
                         "initialize" -> initializeResult()
+                        "initialized", "notifications/initialized" -> buildJsonObject { }
                         "tools/list" -> listTools()
                         "tools/call" -> callTool(params)
                         "resources/list" -> listResources()
                         "resources/read" -> readResource(params)
                         "ping" -> buildJsonObject { put("pong", true) }
+                        "server/discover" -> buildJsonObject {
+                            put("serverInfo", buildJsonObject {
+                                put("name", "DayTrace MCP Server")
+                                put("version", "0.1.0")
+                            })
+                            put("capabilities", buildJsonObject {
+                                put("tools", buildJsonObject { put("listChanged", true) })
+                                put("resources", buildJsonObject { put("listChanged", true) })
+                            })
+                            put("protocolVersion", PROTOCOL_VERSION)
+                        }
                         else -> buildJsonObject {
                             put("code", -32601)
                             put("message", "Method not found: $method")
@@ -442,13 +856,27 @@ class McpServer(
 
         val resp = jsonResponse(results.toString())
         addCorsHeaders(resp)
+
+        logRecorder.log(
+            httpMethod = "POST",
+            httpPath = MCP_ENDPOINT,
+            clientIp = clientIp,
+            responseCode = 200,
+            durationMs = System.currentTimeMillis() - requestStartTime,
+            rpcMethod = "batch",
+            sessionId = sessionId,
+            authResult = authResult,
+            requestBody = body,
+            responseBody = results.toString(),
+            success = true
+        )
         return resp
     }
 
     /** 构建 SSE 格式响应 */
     private fun sseResponse(jsonRpcResponse: String, sessionId: String): Response {
         val sseData = "data: $jsonRpcResponse\n\n"
-        val stream = java.io.ByteArrayInputStream(sseData.toByteArray())
+        val stream = java.io.ByteArrayInputStream(sseData.toByteArray(Charsets.UTF_8))
         val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", stream)
         resp.addHeader("Cache-Control", "no-cache")
         resp.addHeader("Connection", "keep-alive")
@@ -579,6 +1007,194 @@ class McpServer(
             add(toolJson(
                 name = "clear_all_messages",
                 description = "Delete all captured messages. Use with caution!"
+            ))
+            add(toolJson(
+                name = "take_photo",
+                description = "Remote capture a photo from the phone camera. Returns base64-encoded JPEG image data and capture parameters.",
+                properties = buildJsonObject {
+                    put("camera", propObj("string", "Camera to use: 'back' (default) or 'front'", "back"))
+                    put("resolution", propObj("string", "Photo resolution: '720p', '1080p' (default), '4k', 'max', or custom 'WxH' (e.g. '1920x1080')", "1080p"))
+                    put("flash", propObj("string", "Flash mode: 'off' (default), 'on', or 'auto'", "off"))
+                }
+            ))
+            add(toolJson(
+                name = "record_video",
+                description = "Record a short video from the phone camera. Default: 6s 720p MP4 with audio. Returns a download URL or base64-encoded video data.",
+                properties = buildJsonObject {
+                    put("camera", propObj("string", "Camera to use: 'back' (default) or 'front'", "back"))
+                    put("duration", propObj("integer", "Duration in seconds (default 6, max 60)", 6))
+                    put("resolution", propObj("string", "Video resolution: '720p' (default), '1080p', '480p'", "720p"))
+                    put("returnBase64", propObj("boolean", "If true, return video as base64 data (default false, returns download URL)", false))
+                }
+            ))
+            add(toolJson(
+                name = "record_audio",
+                description = "Record audio from the phone microphone. Default: 10s AAC/M4A format. Returns base64-encoded audio data.",
+                properties = buildJsonObject {
+                    put("duration", propObj("integer", "Duration in seconds (default 10, max 300)", 10))
+                    put("format", propObj("string", "Audio format: 'aac' (default, M4A container) or 'wav'", "aac"))
+                }
+            ))
+            add(toolJson(
+                name = "list_captures",
+                description = "List all captured photos, videos, and audio files stored on the device."
+            ))
+            add(toolJson(
+                name = "delete_capture",
+                description = "Delete a captured file by its filename.",
+                properties = buildJsonObject {
+                    put("filename", propObj("string", "Filename to delete (e.g. photo_2026-08-24_14-30-00-000.jpg)", ""))
+                    put("category", propObj("string", "Category: 'photos', 'videos', 'audio', or 'screenshots'", "photos"))
+                },
+                required = listOf("filename")
+            ))
+            add(toolJson(
+                name = "grant_camera_mic_permissions",
+                description = "Attempt to grant CAMERA and RECORD_AUDIO permissions via Shizuku (shell-level pm grant). Requires Shizuku running and authorized."
+            ))
+            add(toolJson(
+                name = "take_screenshot",
+                description = "Capture a screenshot of the current phone screen. Returns base64-encoded image data (PNG or JPEG) and screen metadata. Requires Shizuku running and authorized.",
+                properties = buildJsonObject {
+                    put("format", propObj("string", "Image format: 'png' (default, lossless) or 'jpeg' (compressed, smaller size)", "png"))
+                    put("quality", propObj("integer", "JPEG quality (1-100, default 80). Only used when format=jpeg", 80))
+                    put("returnBase64", propObj("boolean", "If true (default), return image as base64 data. If false, only return download URL", true))
+                }
+            ))
+            add(toolJson(
+                name = "get_screen_text",
+                description = "Extract all visible text from the current phone screen. Uses the accessibility service to traverse the view hierarchy and collect text from all nodes, sorted top-to-bottom by Y position. Set includeBounds=true to get each element's screen coordinates (x, y) and size (width, height) — useful for identifying clickable elements to operate via tap gesture.",
+                properties = buildJsonObject {
+                    put("includeBounds", propObj("boolean", "If true, include bounding box coordinates [x,y] and size [WxH] for each text element. Use this to find element positions for tap/swipe operations. Default false.", false))
+                }
+            ))
+            // === 设备信息 (3) ===
+            add(toolJson(
+                name = "get_device_info",
+                description = "Get comprehensive device information: model, Android version, battery level/charging state, memory/storage usage, screen resolution, and network status."
+            ))
+            add(toolJson(
+                name = "get_app_usage_stats",
+                description = "Get today's app usage statistics (foreground time per app, sorted by duration). Requires PACKAGE_USAGE_STATS permission or Shizuku."
+            ))
+            add(toolJson(
+                name = "get_installed_apps",
+                description = "List all installed apps on the device with package name, app name, version, and whether it's a system app.",
+                properties = buildJsonObject {
+                    put("includeSystem", propObj("boolean", "Include system apps in the list (default false)", false))
+                }
+            ))
+            // === 电池 (1) ===
+            add(toolJson(
+                name = "get_battery_history",
+                description = "Get detailed battery information: level, charging status, health, temperature, voltage, technology, and battery service dump via Shizuku."
+            ))
+            // === 剪贴板 (2) ===
+            add(toolJson(
+                name = "get_clipboard",
+                description = "Read the current content of the system clipboard."
+            ))
+            add(toolJson(
+                name = "set_clipboard",
+                description = "Write text to the system clipboard.",
+                properties = buildJsonObject {
+                    put("text", propObj("string", "Text to set on the clipboard", ""))
+                },
+                required = listOf("text")
+            ))
+            // === 通知 (2) ===
+            add(toolJson(
+                name = "send_notification",
+                description = "Send a local notification to the phone (e.g. for AI to remind the user).",
+                properties = buildJsonObject {
+                    put("title", propObj("string", "Notification title", ""))
+                    put("message", propObj("string", "Notification body text", ""))
+                    put("priority", propObj("string", "Priority: 'low', 'default', or 'high'", "default"))
+                },
+                required = listOf("title", "message")
+            ))
+            add(toolJson(
+                name = "get_notification_log",
+                description = "Get recent notification history (captured by the notification listener service, in-memory cache of last 100).",
+                properties = buildJsonObject {
+                    put("limit", propObj("integer", "Max notifications to return (default 50, max 100)", 50))
+                }
+            ))
+            // === 短信 (1) ===
+            add(toolJson(
+                name = "send_text_message",
+                description = "Send an SMS message to a phone number. Requires SEND_SMS permission (via Shizuku pm grant) or Shizuku shell.",
+                properties = buildJsonObject {
+                    put("phoneNumber", propObj("string", "Recipient phone number", ""))
+                    put("message", propObj("string", "SMS message content", ""))
+                },
+                required = listOf("phoneNumber", "message")
+            ))
+            // === 屏幕操作 (3) ===
+            add(toolJson(
+                name = "take_screenshot_region",
+                description = "Capture a screenshot of a specific region of the screen. Takes a full screenshot first, then crops to the specified bounds. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("left", propObj("integer", "Left boundary (pixels)", 0))
+                    put("top", propObj("integer", "Top boundary (pixels)", 0))
+                    put("right", propObj("integer", "Right boundary (pixels)", 0))
+                    put("bottom", propObj("integer", "Bottom boundary (pixels)", 0))
+                    put("format", propObj("string", "Image format: 'png' (default) or 'jpeg'", "png"))
+                    put("quality", propObj("integer", "JPEG quality 1-100 (default 80)", 80))
+                },
+                required = listOf("left", "top", "right", "bottom")
+            ))
+            add(toolJson(
+                name = "get_screen_interactive_elements",
+                description = "Extract all interactive elements (buttons, input fields, toggles, etc.) from the current screen with their coordinates. Useful for AI to know where to tap. Requires accessibility service."
+            ))
+            add(toolJson(
+                name = "tap_screen",
+                description = "Simulate a tap at the specified screen coordinates. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("x", propObj("integer", "X coordinate (pixels)", 0))
+                    put("y", propObj("integer", "Y coordinate (pixels)", 0))
+                },
+                required = listOf("x", "y")
+            ))
+            // === UI 操作 (3) ===
+            add(toolJson(
+                name = "input_text",
+                description = "Type text into the currently focused input field. ASCII text uses 'input text' command; non-ASCII (e.g. Chinese) uses clipboard paste. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("text", propObj("string", "Text to type into the focused field", ""))
+                },
+                required = listOf("text")
+            ))
+            add(toolJson(
+                name = "press_key",
+                description = "Simulate a key press (Home, Back, Recent, Volume, etc.). Requires Shizuku. Available keys: home, back, recent, menu, power, volume_up, volume_down, volume_mute, delete, enter, escape, tab, space, search, camera, call, end_call, notification, screenshot.",
+                properties = buildJsonObject {
+                    put("key", propObj("string", "Key name (e.g. 'home', 'back') or keycode number", ""))
+                },
+                required = listOf("key")
+            ))
+            add(toolJson(
+                name = "swipe",
+                description = "Simulate a swipe gesture from one point to another. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("startX", propObj("integer", "Start X coordinate", 0))
+                    put("startY", propObj("integer", "Start Y coordinate", 0))
+                    put("endX", propObj("integer", "End X coordinate", 0))
+                    put("endY", propObj("integer", "End Y coordinate", 0))
+                    put("durationMs", propObj("integer", "Swipe duration in milliseconds (default 300)", 300))
+                },
+                required = listOf("startX", "startY", "endX", "endY")
+            ))
+            // === App 操作 (1) ===
+            add(toolJson(
+                name = "open_app",
+                description = "Open/launch an app by its package name. Requires Shizuku.",
+                properties = buildJsonObject {
+                    put("packageName", propObj("string", "App package name (e.g. com.tencent.mm)", ""))
+                    put("activity", propObj("string", "Optional specific activity to launch (e.g. .ui.LauncherUI)", ""))
+                },
+                required = listOf("packageName")
             ))
         }
 
@@ -850,8 +1466,416 @@ class McpServer(
                 "All messages have been deleted."
             }
 
+            "take_photo" -> {
+                val camera = args["camera"]?.jsonPrimitive?.contentOrNull ?: "back"
+                val resolution = args["resolution"]?.jsonPrimitive?.contentOrNull ?: "1080p"
+                val flash = args["flash"]?.jsonPrimitive?.contentOrNull ?: "off"
+
+                // 检查权限
+                val hasPerm = context.checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!hasPerm) {
+                    "Error: CAMERA permission not granted. Call grant_camera_mic_permissions first."
+                } else {
+                    val result = cameraManager.takePhoto(camera, resolution, flash)
+                    if (result != null) {
+                        val base64 = encodeFileBase64(result.file)
+                        buildString {
+                            appendLine("=== Photo Captured ===")
+                            appendLine("Camera: ${result.cameraFacing}")
+                            appendLine("Resolution: ${result.width}x${result.height}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Flash: ${result.flashMode}")
+                            // 拍摄参数
+                            result.focalLength?.let { appendLine("Focal length: ${it}mm") }
+                            result.iso?.let { appendLine("ISO: $it") }
+                            result.exposureTimeNs?.let {
+                                val exposureMs = it / 1_000_000.0
+                                appendLine("Exposure time: ${exposureMs}ms (${it}ns)")
+                            }
+                            result.aperture?.let { appendLine("Aperture: f/$it") }
+                            result.whiteBalanceMode?.let { appendLine("White balance: $it") }
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/photos/${result.file.name}")
+                            if (base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(base64 encoding failed, use download URL)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to capture photo. Check camera permissions and availability."
+                    }
+                }
+            }
+
+            "record_video" -> {
+                val camera = args["camera"]?.jsonPrimitive?.contentOrNull ?: "back"
+                val duration = args["duration"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 60) ?: 6
+                val resolution = args["resolution"]?.jsonPrimitive?.contentOrNull ?: "720p"
+                val returnBase64 = args["returnBase64"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+
+                // 检查权限
+                val hasCamera = context.checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                val hasMic = context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!hasCamera || !hasMic) {
+                    "Error: CAMERA and RECORD_AUDIO permissions required. Call grant_camera_mic_permissions first."
+                } else {
+                    val result = cameraManager.recordVideo(camera, duration, resolution)
+                    if (result != null) {
+                        val base64 = if (returnBase64) encodeFileBase64(result.file) else null
+                        buildString {
+                            appendLine("=== Video Recorded ===")
+                            appendLine("Camera: ${result.cameraFacing}")
+                            appendLine("Resolution: ${result.width}x${result.height}")
+                            appendLine("Duration: ${result.durationSec}s")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/videos/${result.file.name}")
+                            if (returnBase64 && base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(Use download URL or set returnBase64=true for inline data)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to record video. Check camera/mic permissions and availability."
+                    }
+                }
+            }
+
+            "record_audio" -> {
+                val duration = args["duration"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 300) ?: 10
+                val format = args["format"]?.jsonPrimitive?.contentOrNull ?: "aac"
+
+                // 检查权限
+                val hasMic = context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!hasMic) {
+                    "Error: RECORD_AUDIO permission not granted. Call grant_camera_mic_permissions first."
+                } else {
+                    val result = audioManager.recordAudio(duration, format)
+                    if (result != null) {
+                        val base64 = encodeFileBase64(result.file)
+                        buildString {
+                            appendLine("=== Audio Recorded ===")
+                            appendLine("Format: ${result.mimeType}")
+                            appendLine("Duration: ${result.durationSec}s")
+                            appendLine("Sample rate: ${result.sampleRate} Hz")
+                            appendLine("Channels: ${result.channels}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/audio/${result.file.name}")
+                            if (base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(base64 encoding failed, use download URL)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to record audio. Check microphone permissions."
+                    }
+                }
+            }
+
+            "list_captures" -> {
+                val capturesDir = context.getExternalFilesDir("captures")!!
+                buildString {
+                    appendLine("=== Captured Files ===")
+                    for (category in listOf("photos", "videos", "audio", "screenshots")) {
+                        val dir = File(capturesDir, category)
+                        val files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
+                        appendLine()
+                        appendLine("[$category] (${files.size} files)")
+                        if (files.isEmpty()) {
+                            appendLine("  (none)")
+                        } else {
+                            for (f in files) {
+                                val date = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date(f.lastModified()))
+                                appendLine("  ${f.name} (${f.length()} bytes, $date)")
+                            }
+                        }
+                    }
+                }
+            }
+
+            "delete_capture" -> {
+                val filename = args["filename"]?.jsonPrimitive?.contentOrNull ?: ""
+                val category = args["category"]?.jsonPrimitive?.contentOrNull ?: "photos"
+                if (filename.isBlank()) {
+                    "Error: filename is required"
+                } else {
+                    // 安全检查：防止路径遍历
+                    val safeName = File(filename).name
+                    val capturesDir = context.getExternalFilesDir("captures")!!
+                    val file = File(File(capturesDir, category), safeName)
+                    if (file.exists() && file.delete()) {
+                        "Deleted: ${file.name}"
+                    } else {
+                        "File not found or delete failed: $safeName"
+                    }
+                }
+            }
+
+            "grant_camera_mic_permissions" -> {
+                val result = com.daytrace.util.ShizukuHelper.grantCameraAndMicPermissions(context)
+                if (result.isSuccess) {
+                    val cameraGranted = com.daytrace.util.ShizukuHelper.isCameraGranted(context)
+                    val micGranted = com.daytrace.util.ShizukuHelper.isMicGranted(context)
+                    buildString {
+                        appendLine("=== Permission Grant Result ===")
+                        appendLine("Camera: ${if (cameraGranted) "granted" else "NOT granted"}")
+                        appendLine("Microphone: ${if (micGranted) "granted" else "NOT granted"}")
+                        if (!cameraGranted || !micGranted) {
+                            appendLine("Some permissions failed. Please grant manually in Android Settings.")
+                        }
+                    }
+                } else {
+                    "Error: ${result.exceptionOrNull()?.message}"
+                }
+            }
+
+            "take_screenshot" -> {
+                val format = args["format"]?.jsonPrimitive?.contentOrNull ?: "png"
+                val quality = args["quality"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 100) ?: 80
+                val returnBase64 = args["returnBase64"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: true
+
+                // 检查 Shizuku 权限
+                if (!com.daytrace.util.ShizukuHelper.hasPermission()) {
+                    "Error: Shizuku permission not granted. Start Shizuku and authorize DayTrace first."
+                } else {
+                    val result = screenManager.takeScreenshot(format, quality)
+                    if (result != null) {
+                        val base64 = if (returnBase64) screenManager.encodeFileBase64(result.file) else null
+                        buildString {
+                            appendLine("=== Screenshot Captured ===")
+                            appendLine("Format: ${result.format}")
+                            appendLine("Resolution: ${result.width}x${result.height}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Foreground app: ${result.foregroundPackage}")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/screenshots/${result.file.name}")
+                            if (returnBase64 && base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(Use download URL or set returnBase64=true for inline data)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to capture screenshot. Check Shizuku permissions and availability."
+                    }
+                }
+            }
+
+            "get_screen_text" -> {
+                // 检查无障碍服务是否运行
+                if (!com.daytrace.service.CaptureAccessibilityService.isRunning) {
+                    "Error: Accessibility service not running. Enable it in Android Settings or via Shizuku."
+                } else {
+                    val includeBounds = args["includeBounds"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+                    val result = screenManager.getScreenText(includeBounds)
+                    if (result != null) {
+                        buildString {
+                            appendLine("=== Screen Text ===")
+                            appendLine("Foreground app: ${result.foregroundPackage}")
+                            appendLine("Text nodes: ${result.nodeCount}")
+                            appendLine("Timestamp: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.CHINA).format(Date(result.timestamp))}")
+                            appendLine()
+                            appendLine(result.text)
+                            // 如果 includeBounds=true，追加结构化的节点列表（含坐标、尺寸）
+                            result.nodes?.let { nodes ->
+                                if (nodes.isNotEmpty()) {
+                                    appendLine()
+                                    appendLine("=== Elements with Bounds ===")
+                                    appendLine("format: [x,y] WxH \"text\" (source)")
+                                    appendLine("---")
+                                    nodes.forEach { n ->
+                                        appendLine("[${n.left},${n.top}] ${n.width}x${n.height} \"${n.text}\" (${n.source})")
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        "Error: Failed to extract screen text. Accessibility service may not have focus."
+                    }
+                }
+            }
+
+            // === 设备信息 ===
+
+            "get_device_info" -> {
+                deviceInfoManager.getDeviceInfo()
+            }
+
+            "get_app_usage_stats" -> {
+                deviceInfoManager.getAppUsageStats()
+            }
+
+            "get_installed_apps" -> {
+                val includeSystem = args["includeSystem"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
+                deviceInfoManager.getInstalledApps(includeSystem)
+            }
+
+            // === 电池 ===
+
+            "get_battery_history" -> {
+                deviceInfoManager.getBatteryHistory()
+            }
+
+            // === 剪贴板 ===
+
+            "get_clipboard" -> {
+                deviceInfoManager.getClipboard()
+            }
+
+            "set_clipboard" -> {
+                val text = args["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (text.isBlank()) "Error: text is required"
+                else deviceInfoManager.setClipboard(text)
+            }
+
+            // === 通知 ===
+
+            "send_notification" -> {
+                val title = args["title"]?.jsonPrimitive?.contentOrNull ?: ""
+                val message = args["message"]?.jsonPrimitive?.contentOrNull ?: ""
+                val priority = args["priority"]?.jsonPrimitive?.contentOrNull ?: "default"
+                if (title.isBlank() || message.isBlank()) {
+                    "Error: title and message are required"
+                } else {
+                    deviceInfoManager.sendNotification(title, message, priority)
+                }
+            }
+
+            "get_notification_log" -> {
+                val limit = args["limit"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 100) ?: 50
+                val records = com.daytrace.service.NotificationCaptureService.getNotificationHistory(limit)
+                if (records.isEmpty()) {
+                    "No notification history captured yet."
+                } else {
+                    val df = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA)
+                    buildString {
+                        appendLine("=== Notification History (${records.size} of last ${minOf(limit, 100)}) ===")
+                        records.forEach { r ->
+                            val type = if (r.chatType == 2) "[群]" else "[私]"
+                            append("[${df.format(Date(r.timestamp))}] ${r.appName} $type")
+                            if (r.sender.isNotEmpty()) append(" ${r.sender}")
+                            append("\n  ${r.text.take(200)}")
+                            append("\n  (${r.packageName})\n\n")
+                        }
+                    }
+                }
+            }
+
+            // === 短信 ===
+
+            "send_text_message" -> {
+                val phoneNumber = args["phoneNumber"]?.jsonPrimitive?.contentOrNull ?: ""
+                val message = args["message"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (phoneNumber.isBlank() || message.isBlank()) {
+                    "Error: phoneNumber and message are required"
+                } else {
+                    deviceInfoManager.sendTextMessage(phoneNumber, message)
+                }
+            }
+
+            // === 屏幕操作 ===
+
+            "take_screenshot_region" -> {
+                val left = args["left"]?.jsonPrimitive?.intOrNull ?: 0
+                val top = args["top"]?.jsonPrimitive?.intOrNull ?: 0
+                val right = args["right"]?.jsonPrimitive?.intOrNull ?: 0
+                val bottom = args["bottom"]?.jsonPrimitive?.intOrNull ?: 0
+                val format = args["format"]?.jsonPrimitive?.contentOrNull ?: "png"
+                val quality = args["quality"]?.jsonPrimitive?.intOrNull?.coerceIn(1, 100) ?: 80
+
+                if (!com.daytrace.util.ShizukuHelper.hasPermission()) {
+                    "Error: Shizuku permission not granted."
+                } else {
+                    val result = screenManager.takeScreenshotRegion(left, top, right, bottom, format, quality)
+                    if (result != null) {
+                        val base64 = screenManager.encodeFileBase64(result.file)
+                        buildString {
+                            appendLine("=== Screenshot Region Captured ===")
+                            appendLine("Bounds: ($left,$top)-($right,$bottom)")
+                            appendLine("Cropped size: ${result.width}x${result.height}")
+                            appendLine("Format: ${result.format}")
+                            appendLine("File size: ${result.fileSize} bytes")
+                            appendLine("Foreground app: ${result.foregroundPackage}")
+                            appendLine("Download URL: http://<device>:${getListeningPort()}/captures/screenshots/${result.file.name}")
+                            if (base64 != null) {
+                                appendLine()
+                                appendLine("--- base64 ---")
+                                appendLine(base64)
+                            } else {
+                                appendLine("(base64 encoding failed, use download URL)")
+                            }
+                        }
+                    } else {
+                        "Error: Failed to capture screenshot region. Check bounds and Shizuku permissions."
+                    }
+                }
+            }
+
+            "get_screen_interactive_elements" -> {
+                if (!com.daytrace.service.CaptureAccessibilityService.isRunning) {
+                    "Error: Accessibility service not running. Enable it in Android Settings or via Shizuku."
+                } else {
+                    actionManager.getScreenInteractiveElements()
+                        ?: "Error: Failed to get interactive elements. Accessibility service may not have focus."
+                }
+            }
+
+            "tap_screen" -> {
+                val x = args["x"]?.jsonPrimitive?.intOrNull ?: -1
+                val y = args["y"]?.jsonPrimitive?.intOrNull ?: -1
+                actionManager.tapScreen(x, y)
+            }
+
+            // === UI 操作 ===
+
+            "input_text" -> {
+                val text = args["text"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (text.isBlank()) "Error: text is required"
+                else actionManager.inputText(text)
+            }
+
+            "press_key" -> {
+                val key = args["key"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (key.isBlank()) "Error: key is required"
+                else actionManager.pressKey(key)
+            }
+
+            "swipe" -> {
+                val startX = args["startX"]?.jsonPrimitive?.intOrNull ?: 0
+                val startY = args["startY"]?.jsonPrimitive?.intOrNull ?: 0
+                val endX = args["endX"]?.jsonPrimitive?.intOrNull ?: 0
+                val endY = args["endY"]?.jsonPrimitive?.intOrNull ?: 0
+                val durationMs = args["durationMs"]?.jsonPrimitive?.intOrNull?.coerceIn(50, 5000) ?: 300
+                actionManager.swipe(startX, startY, endX, endY, durationMs)
+            }
+
+            // === App 操作 ===
+
+            "open_app" -> {
+                val packageName = args["packageName"]?.jsonPrimitive?.contentOrNull ?: ""
+                val activity = args["activity"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (packageName.isBlank()) "Error: packageName is required"
+                else actionManager.openApp(packageName, activity)
+            }
+
             else -> "Unknown tool: $name"
-        }
+            }
 
         return buildJsonObject {
             put("content", buildJsonArray {
@@ -924,6 +1948,116 @@ class McpServer(
                     put("text", JsonPrimitive(content))
                 })
             })
+        }
+    }
+
+    // === 文件下载端点 ===
+
+    /**
+     * 处理 /captures/<category>/<filename> GET 请求
+     *
+     * 支持的路径：
+     *   /captures/photos/<filename>   — 下载照片
+     *   /captures/videos/<filename>    — 下载视频
+     *   /captures/audio/<filename>     — 下载音频
+     */
+    private fun handleCaptureDownload(
+        uri: String,
+        clientIp: String,
+        authResult: String,
+        requestStartTime: Long
+    ): Response {
+        // 解析路径：/captures/<category>/<filename>
+        val parts = uri.removePrefix("/captures/").split("/", limit = 2)
+        if (parts.size != 2) {
+            val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Invalid path: $uri")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 404, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "Invalid path"
+            )
+            return resp
+        }
+
+        val category = parts[0]
+        val filename = File(parts[1]).name  // 防止路径遍历
+
+        // 验证 category
+        if (category !in listOf("photos", "videos", "audio", "screenshots")) {
+            val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Invalid category: $category")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 404, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "Invalid category: $category"
+            )
+            return resp
+        }
+
+        val capturesDir = context.getExternalFilesDir("captures")!!
+        val file = File(File(capturesDir, category), filename)
+
+        if (!file.exists() || !file.isFile) {
+            val resp = newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "File not found: $filename")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 404, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "File not found: $filename"
+            )
+            return resp
+        }
+
+        // 确定 MIME type
+        val mimeType = when {
+            filename.endsWith(".png", true) -> "image/png"
+            filename.endsWith(".jpg", true) || filename.endsWith(".jpeg", true) -> "image/jpeg"
+            filename.endsWith(".mp4", true) -> "video/mp4"
+            filename.endsWith(".m4a", true) || filename.endsWith(".aac", true) -> "audio/mp4"
+            filename.endsWith(".wav", true) -> "audio/wav"
+            else -> "application/octet-stream"
+        }
+
+        try {
+            val fis = FileInputStream(file)
+            val resp = newFixedLengthResponse(Response.Status.OK, mimeType, fis, file.length())
+            resp.addHeader("Content-Disposition", "attachment; filename=\"$filename\"")
+            resp.addHeader("Content-Length", file.length().toString())
+            addCorsHeaders(resp)
+
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 200, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                responseBody = "file: $filename (${file.length()} bytes)",
+                success = true
+            )
+            return resp
+        } catch (e: Exception) {
+            val resp = newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Read error: ${e.message}")
+            addCorsHeaders(resp)
+            logRecorder.log(
+                httpMethod = "GET", httpPath = uri, clientIp = clientIp,
+                responseCode = 500, durationMs = System.currentTimeMillis() - requestStartTime,
+                rpcMethod = "capture_download", authResult = authResult,
+                success = false, errorMessage = "Read error: ${e.message}"
+            )
+            return resp
+        }
+    }
+
+    /** 将文件编码为 Base64 字符串（用于内嵌返回照片/音频） */
+    private fun encodeFileBase64(file: File): String? {
+        return try {
+            val bytes = file.readBytes()
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            Log.e(TAG, "encodeFileBase64 failed: ${e.message}")
+            null
         }
     }
 
